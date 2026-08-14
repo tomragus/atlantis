@@ -1,0 +1,758 @@
+/* Tropical punch, turned up: cream sheets floating on a deep teal canvas,
+   oversized display type, hard offset shadows instead of soft ones, and the
+   four colours used as flat blocks. The canvas is dark so the artwork and the
+   cream cards carry the eye; anything holding long text stays on cream. */
+:root {
+  --orange: #ff8243;
+  --pink: #ffc0cb;
+  --yellow: #fce883;
+  --teal: #069494;
+
+  --teal-deep: #04403f;
+  --teal-deeper: #032c2c;
+  --teal-bright: #0bb3b3;
+  --orange-deep: #d9601f;
+
+  --cream: #fff6e9;
+  --cream-dim: #f4e7d4;
+  --ink: #101614;
+  --ink-soft: #5d6360;
+  --ink-faint: #8d918e;
+
+  /* On the dark canvas, "faint" has to go lighter rather than darker. */
+  --on-dark: #fff6e9;
+  --on-dark-soft: #b9cfcd;
+  --on-dark-faint: #7fa3a1;
+
+  --line: #e4d6c1;
+  --line-strong: var(--ink);
+
+  --radius: 4px;
+  --radius-pill: 999px;
+
+  /* The hard offset shadow that gives everything its edge. */
+  --lift: 4px 4px 0 var(--ink);
+  --lift-sm: 3px 3px 0 var(--ink);
+  --lift-teal: 4px 4px 0 var(--teal-deeper);
+}
+
+html {
+  height: 100%;
+  color-scheme: light;
+}
+
+html,
+body {
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+body {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  color: var(--on-dark);
+  background: var(--teal-deep);
+  /* A slow tropical wash behind everything, so the dark canvas isn't flat. */
+  background-image:
+    radial-gradient(60rem 40rem at 12% -5%, rgba(255, 130, 67, 0.32), transparent 60%),
+    radial-gradient(50rem 35rem at 95% 8%, rgba(255, 192, 203, 0.22), transparent 55%),
+    radial-gradient(45rem 45rem at 70% 100%, rgba(11, 179, 179, 0.28), transparent 60%);
+  background-attachment: fixed;
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+  padding: 0;
+  margin: 0;
+}
+
+a {
+  color: var(--teal-deep);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 2px;
+  text-decoration-color: var(--orange);
+}
+
+a:hover {
+  color: var(--orange-deep);
+}
+
+/* ---- layout ---------------------------------------------------------- */
+
+.page {
+  display: grid;
+  grid-template-columns: minmax(0, 22rem) minmax(0, 1fr);
+  gap: 2.5rem;
+  width: 100%;
+  max-width: 1320px;
+  margin: 0 auto 5rem;
+  padding: 0 2rem;
+}
+
+.hero {
+  grid-column: 1 / -1;
+  padding: 3.5rem 0 2rem;
+}
+
+.title {
+  font-size: clamp(3rem, 9vw, 7.5rem);
+  font-weight: 700;
+  line-height: 0.85;
+  letter-spacing: -0.055em;
+  text-transform: uppercase;
+  color: var(--cream);
+}
+
+/* The second word drops to an outline so the title reads as two beats. */
+.title-hollow {
+  display: block;
+  color: transparent;
+  -webkit-text-stroke: 2px var(--orange);
+}
+
+/* A ticker under the title, because a studio should feel like it's running. */
+.marquee {
+  margin-top: 1.75rem;
+  padding: 0.55rem 0;
+  border-top: 2px solid var(--yellow);
+  border-bottom: 2px solid var(--yellow);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.marquee-track {
+  display: inline-block;
+  animation: marquee 26s linear infinite;
+  will-change: transform;
+}
+
+.marquee span {
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--yellow);
+  padding-right: 2.5rem;
+}
+
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .marquee-track { animation: none; }
+}
+
+.rail {
+  position: sticky;
+  top: 1.5rem;
+  align-self: start;
+  max-height: calc(100vh - 3rem);
+  overflow-y: auto;
+  padding: 1.5rem;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  background: var(--cream);
+  color: var(--ink);
+  box-shadow: var(--lift);
+}
+
+.stream {
+  min-width: 0;
+}
+
+/* Without this the right-hand column is a blank field of teal on a fresh
+   install, which reads as something failing to load. */
+.stream-empty {
+  padding: 2.5rem 1.5rem;
+  border: 2px dashed rgba(255, 246, 233, 0.35);
+  border-radius: var(--radius);
+  color: var(--on-dark-soft);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+@media (max-width: 1000px) {
+  .page {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.75rem;
+    padding: 0 1.25rem;
+  }
+
+  .rail {
+    position: static;
+    max-height: none;
+    overflow-y: visible;
+  }
+}
+
+/* ---- type ------------------------------------------------------------ */
+
+.subtitle {
+  margin-top: 1.25rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--pink);
+}
+
+.section {
+  margin-top: 1.75rem;
+  padding-top: 1.5rem;
+  border-top: 2px dashed var(--line);
+}
+
+.section-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--teal-deep);
+  margin-bottom: 0.5rem;
+}
+
+.section-note {
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  margin-bottom: 0.9rem;
+}
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.hint {
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+}
+
+.note {
+  margin-top: 0.6rem;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  color: var(--ink-faint);
+}
+
+.meta {
+  font-size: 0.75rem;
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+
+.meta-label {
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 0.66rem;
+  color: var(--teal);
+}
+
+.mono {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+.status-error {
+  margin-top: 1rem;
+  padding: 0.7rem 0.85rem;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  background: var(--orange);
+  color: var(--ink);
+  font-size: 0.82rem;
+  font-weight: 600;
+  box-shadow: var(--lift-sm);
+}
+
+.status-notice {
+  margin-top: 1rem;
+  padding: 0.6rem 0.75rem;
+  border-left: 4px solid var(--teal);
+  background: rgba(6, 148, 148, 0.09);
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+}
+
+/* ---- controls -------------------------------------------------------- */
+
+button {
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 0.5rem 0.95rem;
+  color: var(--ink);
+  background: var(--cream);
+  border: 2px solid var(--ink);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  box-shadow: var(--lift-sm);
+  transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.12s ease;
+}
+
+/* Press = the button physically lands on the page. */
+button:hover:not(:disabled) {
+  background: var(--yellow);
+  transform: translate(1px, 1px);
+  box-shadow: 2px 2px 0 var(--ink);
+}
+
+button:active:not(:disabled) {
+  transform: translate(3px, 3px);
+  box-shadow: 0 0 0 var(--ink);
+}
+
+button:disabled {
+  opacity: 0.4;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+.btn-sm {
+  font-size: 0.68rem;
+  padding: 0.4rem 0.75rem;
+}
+
+.btn-tiny {
+  font-size: 0.6rem;
+  padding: 0.2rem 0.55rem;
+  box-shadow: 2px 2px 0 var(--ink);
+}
+
+.btn-primary {
+  color: var(--cream);
+  background: var(--teal);
+}
+
+.btn-primary:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--yellow);
+}
+
+.btn-lg {
+  width: 100%;
+  margin-top: 1.25rem;
+  font-size: 1.05rem;
+  letter-spacing: 0.06em;
+  padding: 0.9rem 1.4rem;
+  box-shadow: var(--lift);
+}
+
+.btn-danger {
+  color: var(--cream);
+  background: var(--orange-deep);
+}
+
+.btn-danger:hover:not(:disabled),
+.btn-danger.is-armed {
+  color: var(--cream);
+  background: #b3400a;
+}
+
+input[type="text"],
+input:not([type]),
+textarea,
+select {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.55rem 0.7rem;
+  color: var(--ink);
+  background: var(--cream);
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+}
+
+textarea {
+  line-height: 1.6;
+  resize: vertical;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+button:focus-visible {
+  outline: 3px solid var(--orange);
+  outline-offset: 2px;
+}
+
+.field {
+  width: 100%;
+  margin-top: 0.6rem;
+}
+
+input[type="file"] {
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+  max-width: 100%;
+}
+
+input[type="file"]::file-selector-button {
+  font: inherit;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-right: 0.7rem;
+  padding: 0.4rem 0.8rem;
+  color: var(--ink);
+  background: var(--pink);
+  border: 2px solid var(--ink);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  box-shadow: var(--lift-sm);
+}
+
+input[type="file"]::file-selector-button:hover {
+  background: var(--yellow);
+}
+
+.file-picker {
+  display: block;
+  margin: 1.5rem 0 0.5rem;
+}
+
+/* ---- genre picker ---------------------------------------------------- */
+
+.genre {
+  display: flex;
+  gap: 1rem;
+  margin: 1.25rem 0 0;
+  flex-wrap: wrap;
+}
+
+.genre-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  min-width: 0;
+  flex: 1;
+}
+
+.genre-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--teal-deep);
+}
+
+.genre-input {
+  width: 100%;
+}
+
+/* ---- run cards ------------------------------------------------------- */
+
+.runs {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.run-card {
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  background: var(--cream);
+  color: var(--ink);
+  box-shadow: var(--lift);
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+
+.run-card:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 6px 6px 0 var(--ink);
+}
+
+.run-card.is-open {
+  box-shadow: 6px 6px 0 var(--ink);
+}
+
+.run-head {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  width: 100%;
+  padding: 0.9rem 1rem;
+  text-align: left;
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.run-head:hover:not(:disabled) {
+  background: var(--yellow);
+  transform: none;
+  box-shadow: none;
+}
+
+.run-head:active:not(:disabled) {
+  transform: none;
+  box-shadow: none;
+}
+
+.is-open .run-head {
+  border-bottom: 2px solid var(--ink);
+}
+
+/* Runs are numbered newest-first, like tracks on a sleeve. */
+.run-index {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 1.5rem;
+  font-weight: 700;
+  line-height: 1;
+  color: transparent;
+  -webkit-text-stroke: 1.5px var(--orange);
+  flex-shrink: 0;
+}
+
+.run-thumb {
+  object-fit: cover;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  flex-shrink: 0;
+}
+
+.run-thumb-empty {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  font-size: 1.1rem;
+  background: var(--pink);
+}
+
+.run-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+  flex-grow: 1;
+}
+
+.run-name {
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.run-stamp {
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.run-caret {
+  font-size: 0.6rem;
+  color: var(--ink);
+  flex-shrink: 0;
+}
+
+.run-body {
+  padding: 1.15rem 1rem 1.35rem;
+  min-width: 0;
+}
+
+/* ---- pipeline chips --------------------------------------------------- */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  flex-shrink: 0;
+}
+
+.chip {
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 0.22rem 0.5rem;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius-pill);
+  color: var(--ink-faint);
+  background: transparent;
+  white-space: nowrap;
+}
+
+/* Each finished stage gets its own colour, so a glance reads as a bar. */
+.chip.is-done { color: var(--ink); }
+.chip-song.is-done { background: var(--yellow); }
+.chip-art.is-done { background: var(--pink); }
+.chip-loop.is-done { background: var(--orange); }
+.chip-export.is-done { background: var(--teal); color: var(--cream); }
+.chip-post.is-done { background: var(--ink); color: var(--yellow); }
+
+@media (max-width: 700px) {
+  .chips { display: none; }
+}
+
+/* ---- tags, takes, media ----------------------------------------------- */
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.tag {
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 0.18rem 0.55rem;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius-pill);
+  background: var(--pink);
+  color: var(--ink);
+}
+
+.tag-score {
+  margin-left: 0.35rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--orange-deep);
+}
+
+.prompt-line {
+  margin-top: 0.9rem;
+  padding: 0.6rem 0.75rem;
+  border-left: 4px solid var(--yellow);
+  background: rgba(252, 232, 131, 0.25);
+}
+
+.take {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 2px dashed var(--line);
+}
+
+.take-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--teal-deep);
+}
+
+.take-name {
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink-soft);
+}
+
+audio {
+  width: 100%;
+  margin-top: 0.5rem;
+}
+
+.artwork {
+  margin-top: 1.1rem;
+}
+
+.media-row {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.media-wide,
+.media-tall {
+  height: clamp(160px, 21vw, 260px);
+  width: auto;
+  max-width: 100%;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  display: block;
+  background: var(--cream-dim);
+  box-shadow: var(--lift-sm);
+}
+
+/* ---- panels ---------------------------------------------------------- */
+
+.panel {
+  margin-top: 0.85rem;
+  padding: 0.9rem;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  background: var(--yellow);
+  box-shadow: var(--lift-sm);
+}
+
+.panel-note {
+  font-size: 0.75rem;
+  line-height: 1.6;
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.panel-dashed {
+  margin-top: 1.1rem;
+  padding: 0.85rem;
+  border: 2px dashed var(--ink);
+  border-radius: var(--radius);
+  background: rgba(255, 192, 203, 0.3);
+  font-size: 0.78rem;
+}
+
+.panel-dashed > * + * {
+  margin-top: 0.55rem;
+}
+
+.motion-line {
+  margin-top: 0.5rem;
+}
+
+.hashtags {
+  margin-top: 0.6rem;
+  padding: 0.55rem 0.65rem;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  background: var(--cream);
+  font-size: 0.72rem;
+  line-height: 1.8;
+  color: var(--ink-soft);
+}
+
+.downloads {
+  margin-top: 0.9rem;
+  padding-top: 0.9rem;
+  border-top: 2px dashed var(--line);
+}
+
+.results {
+  margin-top: 0.6rem;
+  font-size: 0.72rem;
+  line-height: 1.7;
+  color: var(--ink-soft);
+}
+
+.danger-zone {
+  margin-top: 1.75rem;
+  padding-top: 1.25rem;
+  border-top: 2px dashed var(--line);
+}

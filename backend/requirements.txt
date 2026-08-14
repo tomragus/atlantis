@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+requests
+
+# The SigLIP tagger, which turns an uploaded image into the music prompt. torch
+# is large (~700MB installed) and the model weights (~375MB) download on first
+# use.
+torch
+# Pinned: what get_text_features returns (an output object vs a bare tensor)
+# differs across versions, and the tagger reads .pooler_output off it.
+transformers==5.14.1
+pillow
+sentencepiece

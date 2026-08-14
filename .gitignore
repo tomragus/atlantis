@@ -1,0 +1,22 @@
+# Secrets — never commit these.
+# `.env*` also covers .env.local, .env.production and friends; the negation
+# must come after it to re-admit the blank template.
+.env*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# macOS
+.DS_Store
+
+# Generated songs, uploaded images and the history log (large, local-only)
+backend/history/
