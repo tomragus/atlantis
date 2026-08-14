@@ -20,3 +20,7 @@ out/
 
 # Generated songs, uploaded images and the history log (large, local-only)
 backend/history/
+
+# Local planning/guidance docs — not meant to be published in the repo
+/CLAUDE.md
+/PLAN.md
