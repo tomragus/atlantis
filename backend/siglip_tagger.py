@@ -110,33 +110,99 @@ def _load() -> None:
         _ready = True
 
 
-def siglip_tags(image_bytes: bytes) -> tuple[list[str], dict[str, float]]:
-    """Returns 10 adjectives describing the image, plus each one's score.
+def siglip_tags_by_facet(image_bytes: bytes) -> dict[str, list[tuple[str, float]]]:
+    """Every adjective in every facet, ranked best-first, with its score.
 
-    Filled per facet rather than as a global top 10, which tends to collapse onto
-    one idea and its synonyms.
+    The full ranking rather than just the quota's worth, so a caller (the judge
+    replacement flow in main.py) can swap a flagged tag for the next-best word in
+    the same facet without re-embedding the image.
     """
     _load()
 
     image_vector = _embed_image(image_bytes)
 
-    tags: list[str] = []
-    scores: dict[str, float] = {}
-
+    ranked: dict[str, list[tuple[str, float]]] = {}
     for facet, words in ADJECTIVES.items():
         similarity = (image_vector @ _text_vectors[facet].T).squeeze(0)
-        # Rank on the raw similarity, then calibrate only the few that survive.
-        best, indices = torch.topk(similarity, QUOTAS[facet])
         # SigLIP trained with a sigmoid over a scaled, shifted cosine, so its own
         # scale and bias turn these (a narrow band around 0.1) into readable
         # probabilities. Monotonic, so it changes the numbers but never the ranking.
-        probability = torch.sigmoid(best * _logit_scale + _logit_bias)
-        for rank, index in enumerate(indices):
-            word = words[int(index)]
+        probability = torch.sigmoid(similarity * _logit_scale + _logit_bias)
+        order = torch.argsort(probability, descending=True)
+        ranked[facet] = [
+            (words[int(index)], round(float(probability[index]), 4)) for index in order
+        ]
+    return ranked
+
+
+def _ordered_by_score(tags: list[str], scores: dict[str, float]) -> tuple[list[str], dict[str, float]]:
+    """Sorts tags best-first and rebuilds the score dict to match that order.
+
+    Stable, so ties fall back to whatever order `tags` was already in.
+    """
+    tags = sorted(tags, key=lambda word: scores[word], reverse=True)
+    return tags, {word: scores[word] for word in tags}
+
+
+def select_tags(ranked: dict[str, list[tuple[str, float]]]) -> tuple[list[str], dict[str, float]]:
+    """Takes each facet's top `QUOTAS[facet]` candidates and orders them by score.
+
+    Filled per facet rather than as a global top 10, which tends to collapse onto
+    one idea and its synonyms.
+    """
+    tags: list[str] = []
+    scores: dict[str, float] = {}
+    for facet, candidates in ranked.items():
+        for word, score in candidates[: QUOTAS[facet]]:
             tags.append(word)
-            scores[word] = round(float(probability[rank]), 4)
+            scores[word] = score
 
     # The quotas decide *which* ten survive; this orders them by match strength.
-    # Stable, so ties fall back to the facet order they were collected in.
-    tags.sort(key=lambda word: scores[word], reverse=True)
-    return tags, {word: scores[word] for word in tags}
+    return _ordered_by_score(tags, scores)
+
+
+def replace_flagged_tags(
+    ranked: dict[str, list[tuple[str, float]]],
+    tags: list[str],
+    scores: dict[str, float],
+    flagged: set[str],
+) -> tuple[list[str], dict[str, float]]:
+    """Swaps each flagged tag for the next-best unused word in its own facet.
+
+    Same-facet rather than a flat nearest-match, so a flagged mood word is
+    replaced by another mood word and the quota mix (colour:2, light:1, mood:3,
+    texture:2, energy:1, style:1) never skews. If a facet's candidates are all
+    already in use, the original tag is kept rather than dropped.
+    """
+    word_to_facet = {word: facet for facet, candidates in ranked.items() for word, _ in candidates}
+    used = set(tags)
+
+    new_tags: list[str] = []
+    new_scores = dict(scores)
+    for tag in tags:
+        if tag not in flagged:
+            new_tags.append(tag)
+            continue
+
+        facet = word_to_facet[tag]
+        replacement = next((c for c in ranked[facet] if c[0] not in used), None)
+        if replacement is None:
+            # Every candidate in this facet is already in the tag list -- the
+            # facet's vocabulary is too small relative to its quota for this
+            # image. Visible in the terminal so a systematic case doesn't go
+            # unnoticed, same as judge.py's own fallback for a missing verdict.
+            print(f"siglip_tagger: facet exhausted, keeping flagged tag {tag!r}")
+            new_tags.append(tag)
+            continue
+
+        word, score = replacement
+        used.add(word)
+        new_tags.append(word)
+        new_scores[word] = score
+
+    return _ordered_by_score(new_tags, new_scores)
+
+
+def siglip_tags(image_bytes: bytes) -> tuple[list[str], dict[str, float]]:
+    """Returns 10 adjectives describing the image, plus each one's score."""
+    return select_tags(siglip_tags_by_facet(image_bytes))

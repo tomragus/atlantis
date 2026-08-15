@@ -286,14 +286,27 @@ def list_genres() -> list[str]:
 @app.post("/generate")
 def generate(image: UploadFile = File(...), genre: str = ""):
     # Imported here rather than at module level so `import main` stays fast and
-    # torch is only loaded once an actual request needs it.
-    from siglip_tagger import siglip_tags
+    # torch/anthropic are only loaded once an actual request needs them.
+    from siglip_tagger import siglip_tags_by_facet, select_tags, replace_flagged_tags
+    from judge import judge_image
 
     if genre and genre not in GENRES:
         raise HTTPException(400, f"Unknown genre {genre!r}. See GET /genres.")
 
     image_bytes = read_image(image)
-    tags, tag_scores = siglip_tags(image_bytes)
+    ranked = siglip_tags_by_facet(image_bytes)
+    tags, tag_scores = select_tags(ranked)
+
+    # The judge is a quality improvement, not a hard dependency: if the Claude
+    # call errors (rate limit, timeout, missing key), fall back to the untouched
+    # SigLIP tags rather than failing a request that Suno could still render.
+    try:
+        verdicts = judge_image(image_bytes, tags)
+        flagged = {v["tag"] for v in verdicts if v["flagged"]}
+        if flagged:
+            tags, tag_scores = replace_flagged_tags(ranked, tags, tag_scores, flagged)
+    except Exception as exc:
+        print(f"judge call failed, using unjudged SigLIP tags: {exc}")
 
     # The genre leads the prompt rather than using Suno's `style` parameter,
     # which is its documented home but made no audible difference in testing.

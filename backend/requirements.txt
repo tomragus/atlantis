@@ -3,6 +3,7 @@ uvicorn[standard]
 python-multipart
 python-dotenv
 requests
+anthropic
 
 # The SigLIP tagger, which turns an uploaded image into the music prompt. torch
 # is large (~700MB installed) and the model weights (~375MB) download on first
