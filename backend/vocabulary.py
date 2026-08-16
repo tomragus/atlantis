@@ -18,31 +18,56 @@ ADJECTIVES = {
         "crimson", "scarlet", "amber", "golden", "ochre", "russet", "sepia",
         "teal", "cyan", "azure", "cobalt", "indigo", "violet", "magenta",
         "rosy", "coral", "peach", "olive", "emerald", "jade", "mint",
-        "mustard", "lilac", "lavender", "charcoal", "slate", "ashen", "ivory",
+        "mustard", "lavender", "charcoal", "slate", "ashen", "ivory",
         "cream", "beige", "taupe", "bronze", "copper", "silvery", "pearlescent",
-        "monochrome", "greyscale", "pastel", "neon", "fluorescent", "saturated",
+        "monochrome", "pastel", "neon", "fluorescent", "saturated",
         "desaturated", "muted", "vivid", "washed", "bleached", "inky",
         "verdant", "earthy", "icy",
     ],
     "light": [
         "bright", "dim", "glowing", "luminous", "radiant", "backlit", "shadowy",
         "gloomy", "murky", "dappled", "glaring", "blinding", "soft", "harsh",
-        "diffuse", "hazy", "misty", "foggy", "overcast", "sunlit", "moonlit",
-        "candlelit", "flickering", "shimmering", "gleaming", "sparkling",
+        "diffuse", "hazy", "misty", "overcast", "sunlit", "moonlit",
+        "candlelit", "flickering", "shimmering", "sparkling",
         "dusky", "twilit", "silhouetted", "contrasty", "flat", "dark",
         "blazing", "faint", "smoky", "starlit", "burnished", "cloudy",
         "gilded", "shaded",
     ],
+    # Qualitative/character words only -- a specific flavor of feeling that a
+    # position on the valence and arousal axes below can't express on its own
+    # (e.g. "bittersweet" is literally mixed-valence; "eerie" is about a kind
+    # of ambiguous threat, not just low valence + moderate arousal). Words that
+    # were mostly doing "how positive" or "how activated" duty moved to the
+    # `valence`/`arousal` facets instead of staying here as near-duplicates.
     "mood": [
-        "serene", "tranquil", "peaceful", "calm", "meditative", "melancholy",
-        "wistful", "forlorn", "sombre", "mournful", "joyful", "jubilant",
-        "cheerful", "playful", "whimsical", "dreamy", "ethereal", "mystical",
-        "eerie", "haunting", "ominous", "menacing", "tense", "anxious",
-        "unsettling", "lonely", "desolate", "intimate", "tender", "romantic",
-        "nostalgic", "bittersweet", "hopeful", "triumphant", "defiant",
-        "brooding", "contemplative", "solemn", "reverent", "uneasy",
-        "yearning", "blissful", "euphoric", "sullen", "wary", "sober",
-        "carefree", "wondrous", "grim",
+        "wistful", "playful", "whimsical", "ethereal", "mystical", "eerie",
+        "haunting", "ominous", "menacing", "lonely",
+        "intimate", "tender", "romantic", "nostalgic", "bittersweet",
+        "defiant", "brooding", "solemn", "reverent", "yearning", "sullen",
+        "wary", "sober", "wondrous", "desolate",
+    ],
+    # Positive <-> negative emotional tone. Deliberately spans both ends of
+    # the axis in one list, since the image -- not this file -- decides which
+    # end wins for a given photo.
+    "valence": [
+        "joyful", "hopeful", "carefree", "buoyant", "warm",
+        "content", "elated",
+        "melancholy", "sombre", "bitter", "grim",
+        "wretched", "dismal",
+    ],
+    # Calm <-> excited emotional activation, independent of valence (an image
+    # can be excited-and-joyful or excited-and-anxious). Kept distinct from
+    # `energy`'s vocabulary, which is about the image's visual/kinetic motion
+    # rather than a felt emotional intensity -- SigLIP's own embedding space
+    # doesn't respect that distinction as cleanly (see the Phase 1 facet-check
+    # report), so several arousal words that score close to energy words
+    # (electric, charged, tense...) stayed here deliberately: they're felt-
+    # intensity words even where SigLIP finds them close to motion words.
+    "arousal": [
+        "serene", "calm", "sedate",
+        "hushed", "meditative", "dreamy", "blissful",
+        "electric", "charged", "exhilarated", "euphoric", "tense", "anxious",
+        "wired", "overwrought",
     ],
     "texture": [
         "grainy", "gritty", "smooth", "glossy", "matte", "velvety", "silky",
@@ -50,14 +75,14 @@ ADJECTIVES = {
         "polished", "crisp", "blurry", "smudged", "streaked", "speckled",
         "mottled", "marbled", "woven", "fibrous", "powdery", "chalky", "waxy",
         "glassy", "metallic", "wooden", "stony", "fluffy", "downy", "prickly",
-        "jagged", "sleek", "pitted", "frosted", "dusty", "damp", "slick",
+        "jagged", "pitted", "frosted", "dusty", "damp",
         "brittle", "supple", "grimy",
     ],
     "energy": [
-        "languid", "sluggish", "still", "static", "motionless", "drifting",
+        "languid", "sluggish", "still", "motionless", "drifting",
         "flowing", "swirling", "churning", "frantic", "frenetic", "hectic",
         "bustling", "driving", "pulsing", "throbbing", "surging", "explosive",
-        "restless", "agitated", "jittery", "brisk", "lively", "energetic",
+        "agitated", "jittery", "brisk", "lively", "energetic",
         "dynamic", "kinetic", "sweeping", "cascading", "plunging", "soaring",
         "gentle", "steady", "relentless", "halting", "suspended", "poised",
         "coiled", "unhurried", "urgent", "swaying",
@@ -70,16 +95,21 @@ ADJECTIVES = {
         "documentary", "editorial", "kitsch", "psychedelic", "gothic",
         "brutalist", "bohemian", "folkloric", "cyberpunk", "impressionistic",
         "expressionistic", "naturalistic", "stylised", "cartoonish", "glitchy",
-        "analog", "digital", "ornamental", "utilitarian", "theatrical",
+        "analog", "digital", "utilitarian", "theatrical",
     ],
 }
 
-# How many tags to take from each facet. Sums to 10, weighted toward mood because
-# that is what most shapes how a song feels.
+# How many tags to take from each facet. Sums to 12, weighted toward
+# mood/valence/arousal together (5 of 12) because that's what most shapes how
+# a song feels. valence and arousal each get a guaranteed slot so a tag list
+# can't drift to covering only one axis of feeling (e.g. three mood words
+# that are all low-arousal, saying nothing about how activated the image is).
 QUOTAS = {
     "colour": 2,
     "light": 1,
     "mood": 3,
+    "valence": 1,
+    "arousal": 1,
     "texture": 2,
     "energy": 1,
     "style": 1,

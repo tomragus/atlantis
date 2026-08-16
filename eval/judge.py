@@ -1,6 +1,6 @@
 """LLM-as-judge flow for the SigLIP tag corpus.
 
-For every image in test-images/: get its 10 SigLIP tags, send the image and the
+For every image in test-images/: get its SigLIP tags, send the image and the
 tags to Claude Sonnet 5 acting as a vision judge, and ask it to flag any tag that
 doesn't actually describe the image. Writes eval/results.json (raw data) and
 eval/report.html (human-readable overview).

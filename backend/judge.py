@@ -22,16 +22,16 @@ _client = anthropic.Anthropic()
 # model actually uses for this kind of aesthetic judgment.
 JUDGE_MAX_SIDE = 1024
 
-# One-word adjectives, grouped by six facets in vocabulary.py, is given to the judge
+# One-word adjectives, grouped by eight facets in vocabulary.py, is given to the judge
 # as framing so it understands *why* a tag might be a weak fit (it was chosen by
 # embedding similarity against a fixed vocabulary, not written by a human for this
 # specific image) without leaking which facet each tag came from -- that's an
 # implementation detail the judge doesn't need to do its job.
 JUDGE_PROMPT_TEMPLATE = """You are reviewing the output of an automated image-tagging system.
 
-The system looked at this image and picked these 10 one-word adjectives -- covering \
-colour, lighting, mood, texture, energy, and visual style -- to feed a music generator \
-that will turn this image into a song:
+The system looked at this image and picked these {tag_count} one-word adjectives -- \
+covering colour, lighting, mood, emotional valence, emotional arousal, texture, energy, \
+and visual style -- to feed a music generator that will turn this image into a song:
 
 {tag_list}
 
@@ -53,7 +53,7 @@ is unambiguously grim. Being static, showing the "wrong" literal colour, or othe
 literally depicting the word is NOT, on its own, a reason to flag. If you're genuinely \
 unsure whether a word fits, do not flag it.
 
-Return a verdict for all 10 words, in the same order they were given. For each word, \
+Return a verdict for all {tag_count} words, in the same order they were given. For each word, \
 set "flagged" to true only if it fails the mood standard above, and false otherwise. \
 When "flagged" is true, give a one-sentence "reason" explaining, in terms of the \
 image's actual mood or feeling, why the word doesn't fit. When "flagged" is false, set \
@@ -101,7 +101,7 @@ def judge_image(image_bytes: bytes, tags: list[str]) -> list[dict]:
     image_b64 = base64.b64encode(judge_bytes).decode("ascii")
 
     tag_list = "\n".join(f"- {tag}" for tag in tags)
-    prompt = JUDGE_PROMPT_TEMPLATE.format(tag_list=tag_list)
+    prompt = JUDGE_PROMPT_TEMPLATE.format(tag_list=tag_list, tag_count=len(tags))
 
     response = _client.messages.create(
         model=JUDGE_MODEL,
