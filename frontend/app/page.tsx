@@ -117,6 +117,29 @@ type Analysis = {
 const fileUrl = (path: string) =>
   `${API_URL}/files/${path.split("/").map(encodeURIComponent).join("/")}`;
 
+// Shared by every mutating call (wipe history, extract tags, generate song):
+// fetch, parse JSON, and normalize both an API error (the response body's
+// `detail`) and a network failure into one `Error` with a message fit to
+// show the user -- so each call site's catch block is just `setError`.
+async function apiRequest(
+  url: string,
+  options: RequestInit,
+  fallbackMessage: string,
+) {
+  try {
+    const response = await fetch(url, options);
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail ?? fallbackMessage);
+    }
+    return data;
+  } catch (err) {
+    throw new Error(
+      err instanceof Error ? err.message : "Could not reach the server.",
+    );
+  }
+}
+
 // SigLIP's scores sit in a narrow band near zero, so a flat 3 decimals reads
 // as "0.000" for most of them -- indistinguishable from an actual zero. Shows
 // at least 3 decimals, extended just far enough to surface the first
@@ -158,35 +181,53 @@ function EmbeddingPlot({
   embedding: Embedding;
   finalTags: Set<string>;
 }) {
-  const { points, image } = embedding;
+  const { points } = embedding;
   const [hovered, setHovered] = useState<string | null>(null);
-  if (points.length === 0) return null;
 
-  const xs = points.map((p) => p.x);
-  const ys = points.map((p) => p.y);
-  const spanX = Math.max(...xs) - Math.min(...xs) || 1;
-  const spanY = Math.max(...ys) - Math.min(...ys) || 1;
-  const loX = Math.min(...xs) - spanX * 0.15;
-  const hiX = Math.max(...xs) + spanX * 0.15;
-  const loY = Math.min(...ys) - spanY * 0.15;
-  const hiY = Math.max(...ys) + spanY * 0.15;
+  // Only `hovered` changes on every interaction; the scatter's geometry
+  // (bounds, coordinate mapping, which facets are present) only depends on
+  // `embedding` itself, so it's wasted work to redo the array scans and
+  // rebuild both mapping functions on every hover. `embedding` is a stable
+  // reference across those re-renders (it lives in the parent's state, not
+  // here), so this only recomputes when the tag analysis actually changes.
+  const geometry = useMemo(() => {
+    const { points, image } = embedding;
+    if (points.length === 0) return null;
 
-  const toSvgX = (x: number) =>
-    PLOT_MARGIN + ((x - loX) / (hiX - loX)) * (PLOT_WIDTH - 2 * PLOT_MARGIN);
-  // Flipped: data "up" should render toward the SVG top, where y is smaller.
-  const toSvgY = (y: number) =>
-    PLOT_HEIGHT -
-    PLOT_MARGIN -
-    ((y - loY) / (hiY - loY)) * (PLOT_HEIGHT - 2 * PLOT_MARGIN);
+    const xs = points.map((p) => p.x);
+    const ys = points.map((p) => p.y);
+    const spanX = Math.max(...xs) - Math.min(...xs) || 1;
+    const spanY = Math.max(...ys) - Math.min(...ys) || 1;
+    const loX = Math.min(...xs) - spanX * 0.15;
+    const hiX = Math.max(...xs) + spanX * 0.15;
+    const loY = Math.min(...ys) - spanY * 0.15;
+    const hiY = Math.max(...ys) + spanY * 0.15;
 
-  const imageOffscreen =
-    image.x < loX || image.x > hiX || image.y < loY || image.y > hiY;
-  const imageX = clamp(image.x, loX, hiX);
-  const imageY = clamp(image.y, loY, hiY);
+    const toSvgX = (x: number) =>
+      PLOT_MARGIN + ((x - loX) / (hiX - loX)) * (PLOT_WIDTH - 2 * PLOT_MARGIN);
+    // Flipped: data "up" should render toward the SVG top, where y is smaller.
+    const toSvgY = (y: number) =>
+      PLOT_HEIGHT -
+      PLOT_MARGIN -
+      ((y - loY) / (hiY - loY)) * (PLOT_HEIGHT - 2 * PLOT_MARGIN);
 
-  const facets = FACET_ORDER.filter((facet) =>
-    points.some((p) => p.facet === facet),
-  );
+    const imageOffscreen =
+      image.x < loX || image.x > hiX || image.y < loY || image.y > hiY;
+
+    return {
+      toSvgX,
+      toSvgY,
+      imageOffscreen,
+      imageX: clamp(image.x, loX, hiX),
+      imageY: clamp(image.y, loY, hiY),
+      facets: FACET_ORDER.filter((facet) =>
+        points.some((p) => p.facet === facet),
+      ),
+    };
+  }, [embedding]);
+
+  if (!geometry) return null;
+  const { toSvgX, toSvgY, imageOffscreen, imageX, imageY, facets } = geometry;
 
   const hoveredPoint =
     hovered === "image" ? null : points.find((p) => p.tag === hovered);
@@ -534,21 +575,18 @@ export default function Home() {
     setError(null);
 
     try {
-      const response = await fetch(`${API_URL}/history`, { method: "DELETE" });
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.detail ?? "Could not clear the history.");
-      }
+      const data = await apiRequest(
+        `${API_URL}/history`,
+        { method: "DELETE" },
+        "Could not clear the history.",
+      );
       setHistory([]);
       setNotice(
         `Deleted ${data.entries_removed} runs, ${data.files_removed} files, ` +
           `${data.megabytes_freed} MB freed.`,
       );
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Could not reach the server.",
-      );
+      setError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -576,20 +614,14 @@ export default function Home() {
     const genreParam = genre ? `?genre=${encodeURIComponent(genre)}` : "";
 
     try {
-      const response = await fetch(`${API_URL}/tag${genreParam}`, {
-        method: "POST",
-        body,
-      });
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.detail ?? "Could not analyze the image.");
-      }
+      const data = await apiRequest(
+        `${API_URL}/tag${genreParam}`,
+        { method: "POST", body },
+        "Could not analyze the image.",
+      );
       setAnalysis(data);
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Could not reach the server.",
-      );
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setAnalyzing(false);
     }
@@ -612,22 +644,16 @@ export default function Home() {
     const genreParam = genre ? `?genre=${encodeURIComponent(genre)}` : "";
 
     try {
-      const response = await fetch(`${API_URL}/generate${genreParam}`, {
-        method: "POST",
-        body,
-      });
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.detail ?? "Could not generate a song.");
-      }
+      const data = await apiRequest(
+        `${API_URL}/generate${genreParam}`,
+        { method: "POST", body },
+        "Could not generate a song.",
+      );
       setHistory((previous) => [data, ...previous]);
       setAnalysis(null);
       setFile(null);
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Could not reach the server.",
-      );
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }

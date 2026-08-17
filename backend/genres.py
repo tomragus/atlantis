@@ -8,6 +8,8 @@ Ordered by family rather than alphabetically, because the picker is a knob you s
 to browse.
 """
 
+from fastapi import HTTPException
+
 GENRES = [
     # rock and guitar
     "rock",
@@ -43,3 +45,12 @@ PROMPT_TERMS = {
 def prompt_term(genre: str) -> str:
     """The text that goes into the Suno prompt for a picked genre."""
     return PROMPT_TERMS.get(genre, genre)
+
+
+def validate_genre(genre: str) -> None:
+    """Raises if `genre` is non-empty and not one of GENRES.
+
+    Empty is always fine -- it means no genre was picked.
+    """
+    if genre and genre not in GENRES:
+        raise HTTPException(400, f"Unknown genre {genre!r}. See GET /genres.")

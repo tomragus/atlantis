@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # Safe to import at module level: plain strings and a lookup, no heavy dependencies.
-from genres import GENRES, prompt_term
+from genres import GENRES, prompt_term, validate_genre
 
 # Reads backend/.env and puts the keys into the process environment,
 # so os.environ can see them below.
@@ -354,8 +354,7 @@ def tag(image: UploadFile = File(...), genre: str = ""):
     )
     from judge import judge_image
 
-    if genre and genre not in GENRES:
-        raise HTTPException(400, f"Unknown genre {genre!r}. See GET /genres.")
+    validate_genre(genre)
 
     image_bytes = read_image(image)
     ranked = siglip_tags_by_facet(image_bytes)
@@ -405,8 +404,7 @@ def generate(
     Deliberately does no tagging of its own -- the image, tags, and judge
     verdicts were already settled in `/tag`, so this step is Suno + history only.
     """
-    if genre and genre not in GENRES:
-        raise HTTPException(400, f"Unknown genre {genre!r}. See GET /genres.")
+    validate_genre(genre)
 
     image_bytes = read_image(image)
     job = request_song(prompt)

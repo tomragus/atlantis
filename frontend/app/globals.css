@@ -178,12 +178,6 @@ a:hover {
   margin-bottom: 0.5rem;
 }
 
-.section-note {
-  font-size: 0.82rem;
-  color: var(--ink-soft);
-  margin-bottom: 0.9rem;
-}
-
 .row {
   display: flex;
   gap: 0.5rem;
@@ -278,11 +272,6 @@ button:disabled {
 .btn-sm {
   font-size: 0.7rem;
   padding: 0.38rem 0.7rem;
-}
-
-.btn-tiny {
-  font-size: 0.62rem;
-  padding: 0.2rem 0.55rem;
 }
 
 .btn-primary {
@@ -473,15 +462,6 @@ input[type="file"]::file-selector-button:hover {
   border: 1px solid var(--line-strong);
   border-radius: var(--radius);
   flex-shrink: 0;
-}
-
-.run-thumb-empty {
-  display: grid;
-  place-items: center;
-  width: 46px;
-  height: 46px;
-  font-size: 1.1rem;
-  background: var(--paper-dim);
 }
 
 .run-head-text {
