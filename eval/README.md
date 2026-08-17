@@ -21,7 +21,7 @@ backend/.venv/bin/python eval/judge.py
 Run from the repo root (or adjust paths accordingly -- `judge.py` resolves
 `test-images/` and `backend/` relative to its own location, not the cwd).
 
-This calls `siglip_tags()` directly from `backend/siglip_tagger.py` -- it never
+This calls `siglip_tags()` directly from `backend/embedding_tagger.py` -- it never
 starts the FastAPI app, never calls `/generate`, and never touches
 `apiframe_call`/`request_song`/Suno. Uses `ANTHROPIC_API_KEY` (real, billed API
 calls -- one Claude Sonnet 5 call per image), no Suno/apiframe involved.
@@ -75,9 +75,9 @@ cd eval
   are separately resized to 320px JPEG to keep `report.html` small.
 - **Out of scope** (per `PLAN-eval.md`): no changes to `vocabulary.py`, no
   ground-truth manifest, no CI integration, no comparison against any model
-  other than `gemma3:12b`. `siglip_tagger.py` is no longer entirely out of
-  scope: the live app's `/generate` now calls the judge (`backend/judge.py`,
+  other than `gemma3:12b`. `embedding_tagger.py` is no longer entirely out of
+  scope: the live app's `/tag` now calls the judge (`backend/judge.py`,
   the same module this script imports) and replaces any flagged tag with the
-  next-nearest same-facet candidate via `siglip_tagger.replace_flagged_tags()`.
+  next-nearest same-facet candidate via `embedding_tagger.replace_flagged_tags()`.
   This eval script itself still only reports what the judge flags -- it does
   not exercise the replacement path.

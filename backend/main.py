@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # Safe to import at module level: plain strings and a lookup, no heavy dependencies.
+from algorithms import ALGORITHMS, ALGORITHM_INFO, validate_algorithm
 from genres import GENRES, prompt_term, validate_genre
 
 # Reads backend/.env and puts the keys into the process environment,
@@ -165,6 +166,7 @@ def save_to_history(
     job: dict,
     genre: str,
     tagging: dict,
+    algorithm: str,
 ) -> dict:
     """Writes the image, every take Suno rendered, and one JSONL row for the run.
 
@@ -220,6 +222,7 @@ def save_to_history(
         # Empty when the user picked no genre, in which case nothing was
         # prepended and the prompt is purely the image's tags.
         "genre": genre,
+        "algorithm": algorithm,
         "tags": tags,
         "tag_scores": tag_scores,
         "tagging": tagging,
@@ -227,6 +230,10 @@ def save_to_history(
         "job_id": job["id"],
         "tracks": tracks,
     }
+    # CoCa's caption is display-only (never touches tag selection or the Suno
+    # prompt) but worth keeping on the history record when it was generated.
+    if "caption" in tagging:
+        record["caption"] = tagging["caption"]
 
     with HISTORY_FILE.open("a") as history:
         history.write(json.dumps(record) + "\n")
@@ -285,6 +292,12 @@ def list_genres() -> list[str]:
     return GENRES
 
 
+@app.get("/algorithms")
+def list_algorithms() -> list[dict]:
+    """The embedding algorithms the picker offers, with a label/blurb each."""
+    return [{"id": algorithm, **ALGORITHM_INFO[algorithm]} for algorithm in ALGORITHMS]
+
+
 def build_tagging_summary(
     ranked: dict,
     selected_tags: list[str],
@@ -299,11 +312,11 @@ def build_tagging_summary(
     `ranked` already holds every candidate word per facet (see
     `siglip_tags_by_facet`), so this is pure bookkeeping: no re-scoring.
     """
-    # Deferred like the other siglip_tagger imports in `tag()` below -- this
+    # Deferred like the other embedding_tagger imports in `tag()` below -- this
     # function is only ever called from there, after torch is already loaded,
     # but importing it lazily here too keeps `build_tagging_summary` correct
     # to call on its own rather than relying on caller-side import ordering.
-    from siglip_tagger import word_to_facet
+    from embedding_tagger import word_to_facet
 
     facet_of = word_to_facet(ranked)
 
@@ -335,8 +348,8 @@ def build_tagging_summary(
 
 
 @app.post("/tag")
-def tag(image: UploadFile = File(...), genre: str = ""):
-    """Runs the tagging half of the pipeline only: SigLIP scoring + the judge.
+def tag(image: UploadFile = File(...), genre: str = "", algorithm: str = "siglip"):
+    """Runs the tagging half of the pipeline only: embedding scoring + the judge.
 
     No Suno call and nothing saved to history -- this is the free, fast preview
     that lets a user see (and the judge react to) an image's tags before they
@@ -346,24 +359,27 @@ def tag(image: UploadFile = File(...), genre: str = ""):
     """
     # Imported here rather than at module level so `import main` stays fast and
     # torch/anthropic are only loaded once an actual request needs them.
-    from siglip_tagger import (
-        siglip_tags_by_facet,
+    from embedding_tagger import (
+        tags_by_facet,
         select_tags,
         replace_flagged_tags,
         embedding_projection,
+        generate_caption,
     )
     from judge import judge_image
 
     validate_genre(genre)
+    validate_algorithm(algorithm)
 
     image_bytes = read_image(image)
-    ranked = siglip_tags_by_facet(image_bytes)
+    ranked = tags_by_facet(image_bytes, algorithm=algorithm)
     tags, tag_scores = select_tags(ranked)
     selected_tags, selected_scores = tags, tag_scores
 
     # The judge is a quality improvement, not a hard dependency: if the Claude
     # call errors (rate limit, timeout, missing key), fall back to the untouched
-    # SigLIP tags rather than failing a request that Suno could still render.
+    # embedding tags rather than failing a request that Suno could still render.
+    # Runs identically regardless of which algorithm produced the tags it reviews.
     verdicts: list[dict] = []
     replacements: dict[str, str] = {}
     try:
@@ -374,26 +390,40 @@ def tag(image: UploadFile = File(...), genre: str = ""):
                 ranked, tags, tag_scores, flagged
             )
     except Exception as exc:
-        print(f"judge call failed, using unjudged SigLIP tags: {exc}")
+        print(f"judge call failed, using unjudged tags: {exc}")
 
     tagging = build_tagging_summary(
         ranked, selected_tags, selected_scores, verdicts, tags, tag_scores, replacements
     )
     tagging["embedding"] = embedding_projection(
-        image_bytes, [(point["tag"], point["facet"]) for point in tagging["top20"]]
+        image_bytes,
+        [(point["tag"], point["facet"]) for point in tagging["top20"]],
+        algorithm=algorithm,
     )
+
+    # CoCa-only: a free-text caption, display-only -- never fed into the tags or
+    # the Suno prompt below.
+    if algorithm == "coca":
+        tagging["caption"] = generate_caption(image_bytes)
 
     # The genre leads the prompt rather than using Suno's `style` parameter,
     # which is its documented home but made no audible difference in testing.
     prompt = ", ".join([prompt_term(genre), *tags] if genre else tags)
 
-    return {"tags": tags, "tag_scores": tag_scores, "tagging": tagging, "prompt": prompt}
+    return {
+        "tags": tags,
+        "tag_scores": tag_scores,
+        "tagging": tagging,
+        "prompt": prompt,
+        "algorithm": algorithm,
+    }
 
 
 @app.post("/generate")
 def generate(
     image: UploadFile = File(...),
     genre: str = "",
+    algorithm: str = "siglip",
     tags: str = Form(...),
     tag_scores: str = Form(...),
     tagging: str = Form(...),
@@ -403,8 +433,12 @@ def generate(
 
     Deliberately does no tagging of its own -- the image, tags, and judge
     verdicts were already settled in `/tag`, so this step is Suno + history only.
+    `algorithm` isn't used for anything here except recording which one produced
+    the tags being rendered -- validating it doesn't need embedding_tagger's heavy
+    imports, so it's checked against the lightweight `algorithms` module instead.
     """
     validate_genre(genre)
+    validate_algorithm(algorithm)
 
     image_bytes = read_image(image)
     job = request_song(prompt)
@@ -418,6 +452,7 @@ def generate(
         job,
         genre,
         json.loads(tagging),
+        algorithm,
     )
 
 

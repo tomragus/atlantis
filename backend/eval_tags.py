@@ -15,7 +15,7 @@ import glob
 import os
 import statistics
 
-from siglip_tagger import siglip_tags_by_facet
+from embedding_tagger import siglip_tags_by_facet
 
 CORPUS_DIR = os.path.join(os.path.dirname(__file__), "..", "test-images")
 

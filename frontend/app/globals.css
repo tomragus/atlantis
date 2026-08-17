@@ -363,7 +363,37 @@ input[type="file"]::file-selector-button:hover {
   margin: 1.5rem 0 0.5rem;
 }
 
-/* ---- genre picker ---------------------------------------------------- */
+/* ---- algorithm picker (rail's primary control) ------------------------ */
+
+.algorithm {
+  display: flex;
+  gap: 1rem;
+  margin: 1.25rem 0 0;
+  flex-wrap: wrap;
+}
+
+.algorithm-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
+  flex: 1;
+  justify-content: center;
+}
+
+.algorithm-name {
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+/* ---- genre picker (demoted to a small optional card) ------------------ */
+
+.genre-card {
+  padding: 1.25rem 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+}
 
 .genre {
   display: flex;
@@ -548,6 +578,21 @@ input[type="file"]::file-selector-button:hover {
   margin-left: 0.35rem;
   font-variant-numeric: tabular-nums;
   color: var(--accent);
+}
+
+/* ---- caption (CoCa) ----------------------------------------------------- */
+
+.caption-block {
+  margin-top: 0.9rem;
+  padding: 0.6rem 0.75rem;
+  border-left: 2px solid var(--accent);
+  background: var(--accent-soft);
+}
+
+.caption-text {
+  margin: 0.3rem 0 0;
+  font-style: italic;
+  font-size: 0.85rem;
 }
 
 /* ---- judge review ------------------------------------------------------ */

@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import GenreKnob from "./GenreKnob";
+import SpinKnob from "./SpinKnob";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 
@@ -30,6 +30,15 @@ type Replacement = {
   to: string;
 };
 
+// What GET /algorithms returns: the embedding algorithms the picker offers, each
+// with a display label and a one-line blurb (surfaced in the algorithm-selector
+// card and used to keep score-meaning copy algorithm-aware).
+type AlgorithmInfo = {
+  id: string;
+  label: string;
+  blurb: string;
+};
+
 type EmbeddingPoint = {
   tag: string;
   facet: string;
@@ -37,9 +46,10 @@ type EmbeddingPoint = {
   y: number;
 };
 
-// A 2D PCA projection of the top-20 candidates' SigLIP vectors, with the
-// image vector projected onto that same basis -- illustrative only, see
-// `embedding_projection` in backend/siglip_tagger.py for the caveats.
+// A 2D PCA projection of the top-20 candidates' vectors in the chosen
+// algorithm's embedding space, with the image vector projected onto that
+// same basis -- illustrative only, see `embedding_projection` in
+// backend/embedding_tagger.py for the caveats.
 type Embedding = {
   model: string;
   source_dimensions: number;
@@ -58,6 +68,9 @@ type Tagging = {
   final: FacetTag[];
   replacements: Replacement[];
   embedding?: Embedding;
+  // CoCa-only: a free-text caption from its captioning head. Display-only --
+  // never fed into tag selection or the Suno prompt.
+  caption?: string;
 };
 
 // Fixed hue order for the 8 facets, never reassigned/cycled per-render --
@@ -91,8 +104,12 @@ type Generation = {
   timestamp: string;
   image: string;
   genre: string;
+  // Absent on runs saved before algorithm choice was tracked -- those all ran
+  // through SigLIP, the only option that existed at the time.
+  algorithm?: string;
   tags: string[];
-  // SigLIP's confidence per tag, keyed by the tag itself.
+  // The picked algorithm's own confidence/similarity score per tag, keyed by
+  // the tag itself -- see TagBreakdown's score-meaning note for how to read it.
   tag_scores: Record<string, number>;
   tagging?: Tagging;
   prompt: string;
@@ -109,6 +126,7 @@ type Analysis = {
   tag_scores: Record<string, number>;
   tagging: Tagging;
   prompt: string;
+  algorithm: string;
 };
 
 // Saved images and MP3s are served by the backend out of its history folder.
@@ -167,19 +185,21 @@ function estimateTextWidth(text: string) {
 
 // A 2D scatter of the top-20 tag candidates, color-coded by facet, with the
 // image's projected position marked separately, on its own dark panel.
-// SigLIP's image/text "modality gap" means the image often lands well
-// outside the tag cluster (see embedding_projection's docstring in
-// siglip_tagger.py) -- rather than stretch the shared scale to fit it and
-// crush all 20 tags into a corner, the image marker is clamped to the plot's
-// edge and flagged as approximate. Points aren't directly labeled (they
+// SigLIP/CLIP-family models' image/text "modality gap" means the image often
+// lands well outside the tag cluster (see embedding_projection's docstring in
+// backend/embedding_tagger.py) -- rather than stretch the shared scale to fit
+// it and crush all 20 tags into a corner, the image marker is clamped to the
+// plot's edge and flagged as approximate. Points aren't directly labeled (they
 // overlap too easily when several near-synonyms land close together) --
 // hover or focus a point for its exact tag and facet instead.
 function EmbeddingPlot({
   embedding,
   finalTags,
+  algorithmLabel,
 }: {
   embedding: Embedding;
   finalTags: Set<string>;
+  algorithmLabel: string;
 }) {
   const { points } = embedding;
   const [hovered, setHovered] = useState<string | null>(null);
@@ -255,7 +275,7 @@ function EmbeddingPlot({
       <svg
         viewBox={`0 0 ${PLOT_WIDTH} ${PLOT_HEIGHT}`}
         role="img"
-        aria-label="2D projection of the top 20 tag candidates and the image in SigLIP's embedding space. Hover a point for its tag and facet."
+        aria-label={`2D projection of the top 20 tag candidates and the image in ${algorithmLabel}'s embedding space. Hover a point for its tag and facet.`}
       >
         {points.map((p) => {
           const isFinal = finalTags.has(p.tag);
@@ -337,7 +357,7 @@ function EmbeddingPlot({
       </div>
 
       <p className="note">
-        SigLIP embeds the image and each candidate word into a{" "}
+        {algorithmLabel} embeds the image and each candidate word into a{" "}
         {embedding.source_dimensions}-dimensional vector; PCA projects those
         vectors onto the two directions of greatest variance so they can be
         plotted here in 2D. The selected tags are bright, the other
@@ -349,13 +369,13 @@ function EmbeddingPlot({
         Circle size/brightness marks selection, not rank -- for a word&rsquo;s
         actual match strength, read its score above. Distance between two{" "}
         <em>tag</em> points is the meaningful reading here: tags sitting close
-        together really are similar to each other in SigLIP&rsquo;s full
-        space. Distance from a tag to the image marker isn&rsquo;t reliable
-        the same way -- SigLIP&rsquo;s image and text embeddings occupy
-        separate regions of the space almost regardless of how well a word
-        actually fits (a &ldquo;modality gap&rdquo;), so the
-        image&rsquo;s position here says little about any one tag&rsquo;s
-        fit.
+        together really are similar to each other in {algorithmLabel}&rsquo;s
+        full space. Distance from a tag to the image marker isn&rsquo;t
+        reliable the same way -- SigLIP/CLIP-family models&rsquo; image and
+        text embeddings occupy separate regions of the space almost
+        regardless of how well a word actually fits (a &ldquo;modality
+        gap&rdquo;), so the image&rsquo;s position here says little about any
+        one tag&rsquo;s fit.
       </p>
     </div>
   );
@@ -369,23 +389,36 @@ function TagBreakdown({
   tagScores,
   tagging,
   prompt,
+  algorithm,
+  algorithmLabel,
 }: {
   tags: string[];
   tagScores: Record<string, number>;
   tagging?: Tagging;
   prompt: string;
+  // Absent on runs saved before algorithm choice was tracked, all of which ran
+  // through SigLIP -- both default to it so old history cards still read right.
+  algorithm?: string;
+  algorithmLabel?: string;
 }) {
   // Runs saved before tagging detail was tracked fall back to the plain
   // tag+score list, with no facet label.
   const finalTags: { tag: string; facet?: string; score?: number }[] =
     tagging?.final ?? tags.map((tag) => ({ tag, score: tagScores?.[tag] }));
 
+  // Only SigLIP has a trained calibration head turning cosine similarity into a
+  // 0-1 probability (see backend/embedding_tagger.py's module docstring) -- every
+  // other algorithm here scores with raw cosine similarity on its own scale, so
+  // the score-meaning copy has to say something different for it.
+  const calibrated = (algorithm ?? "siglip") === "siglip";
+  const label = algorithmLabel ?? "SigLIP";
+
   return (
     <>
       {finalTags.length > 0 && (
         <>
           {/* One tag set drove both takes, so it sits above them rather than
-              being repeated. Strongest SigLIP match first. */}
+              being repeated. Strongest match first. */}
           <div className="tags">
             {finalTags.map(({ tag, facet, score }) => (
               <span key={tag} className="tag-group">
@@ -400,12 +433,37 @@ function TagBreakdown({
             ))}
           </div>
           <p className="note">
-            The number beside each tag is SigLIP&rsquo;s match probability for that
-            word against this image (0–1) -- not a rank. Scores across the
-            whole vocabulary sit close to zero, so small differences still
-            mean one word fit noticeably better than another.
+            {calibrated ? (
+              <>
+                The number beside each tag is {label}&rsquo;s match
+                probability for that word against this image (0–1) -- not a
+                rank. Scores across the whole vocabulary sit close to zero, so
+                small differences still mean one word fit noticeably better
+                than another.
+              </>
+            ) : (
+              <>
+                The number beside each tag is raw cosine similarity between
+                the image and that word in {label}&rsquo;s own embedding
+                space -- not a rank, and not on the same 0–1 scale as SigLIP&rsquo;s
+                calibrated probability, so it isn&rsquo;t meaningful to
+                compare these numbers across algorithms.
+              </>
+            )}
           </p>
         </>
+      )}
+
+      {tagging?.caption && (
+        <div className="caption-block">
+          <span className="meta-label">caption</span>
+          <p className="caption-text">&ldquo;{tagging.caption}&rdquo;</p>
+          <p className="note">
+            {label}&rsquo;s captioning head describing the image in free text
+            -- shown for comparison only, never sent to Suno or used to pick
+            tags.
+          </p>
+        </div>
       )}
 
       {tagging &&
@@ -472,6 +530,7 @@ function TagBreakdown({
           <EmbeddingPlot
             embedding={tagging.embedding}
             finalTags={new Set(tagging.final.map((f) => f.tag))}
+            algorithmLabel={label}
           />
         </div>
       )}
@@ -501,6 +560,17 @@ export default function Home() {
   // A half-typed word simply isn't a genre yet, which is what `genre` derives.
   const [query, setQuery] = useState("");
   const genre = genres.includes(query) ? query : "";
+
+  // The rail's primary control: which embedding algorithm tags the image.
+  // Defaults to SigLIP, today's only algorithm before this and still the one
+  // with a calibrated score (see TagBreakdown's score-meaning note).
+  const [algorithms, setAlgorithms] = useState<AlgorithmInfo[]>([]);
+  const [algorithm, setAlgorithm] = useState("siglip");
+  const algorithmLabels = useMemo(
+    () => Object.fromEntries(algorithms.map((a) => [a.id, a.label])),
+    [algorithms],
+  );
+  const algorithmLabel = algorithmLabels[algorithm] ?? algorithm;
   // Deleting is irreversible and nothing is backed up, so the button has to be
   // clicked twice. This holds whether it is currently armed.
   const [armed, setArmed] = useState(false);
@@ -513,13 +583,17 @@ export default function Home() {
   const [apiDown, setApiDown] = useState(false);
 
   // Genre leads the prompt, so a stale analysis would send the wrong prompt
-  // to Suno if the genre changed after analyzing. Re-analyzing is cheap, so
-  // just clear it rather than silently patching the prompt. Adjusted during
-  // render (same pattern as GenreKnob's own prop-follow) rather than in an
-  // effect, so it can't cause an extra paint.
+  // to Suno if the genre changed after analyzing. Algorithm choice changes
+  // the tags themselves. Either one changing after analyzing makes the held
+  // analysis stale, so re-analyzing is cheap and it's just cleared rather
+  // than silently patched. Adjusted during render (same pattern as
+  // SpinKnob's own prop-follow) rather than in an effect, so it can't cause
+  // an extra paint.
   const [seenGenre, setSeenGenre] = useState(genre);
-  if (genre !== seenGenre) {
+  const [seenAlgorithm, setSeenAlgorithm] = useState(algorithm);
+  if (genre !== seenGenre || algorithm !== seenAlgorithm) {
     setSeenGenre(genre);
+    setSeenAlgorithm(algorithm);
     setAnalysis(null);
   }
 
@@ -542,6 +616,11 @@ export default function Home() {
       .then((response) => response.json())
       .then(setGenres)
       .catch(offline("Could not load the genre list."));
+
+    fetch(`${API_URL}/algorithms`)
+      .then((response) => response.json())
+      .then(setAlgorithms)
+      .catch(offline("Could not load the algorithm list."));
   }, []);
 
   // A button that stays armed is its own trap, so it disarms itself shortly
@@ -611,11 +690,12 @@ export default function Home() {
     const body = new FormData();
     body.append("image", file);
 
-    const genreParam = genre ? `?genre=${encodeURIComponent(genre)}` : "";
+    const params = new URLSearchParams({ algorithm });
+    if (genre) params.set("genre", genre);
 
     try {
       const data = await apiRequest(
-        `${API_URL}/tag${genreParam}`,
+        `${API_URL}/tag?${params}`,
         { method: "POST", body },
         "Could not analyze the image.",
       );
@@ -641,11 +721,12 @@ export default function Home() {
     body.append("tagging", JSON.stringify(analysis.tagging));
     body.append("prompt", analysis.prompt);
 
-    const genreParam = genre ? `?genre=${encodeURIComponent(genre)}` : "";
+    const params = new URLSearchParams({ algorithm: analysis.algorithm });
+    if (genre) params.set("genre", genre);
 
     try {
       const data = await apiRequest(
-        `${API_URL}/generate${genreParam}`,
+        `${API_URL}/generate?${params}`,
         { method: "POST", body },
         "Could not generate a song.",
       );
@@ -690,17 +771,106 @@ export default function Home() {
             className="file-picker"
           />
 
+          <section className="algorithm">
+            <SpinKnob
+              options={algorithms.map((a) => a.id)}
+              value={algorithm}
+              onChange={setAlgorithm}
+              label="Embedding algorithm"
+              disabled={busy}
+            />
+
+            <div className="algorithm-fields">
+              <span className="genre-label">Algorithm</span>
+              <span className="algorithm-name">{algorithmLabel}</span>
+              <p className="hint">
+                {algorithms.find((a) => a.id === algorithm)?.blurb ?? ""}
+              </p>
+            </div>
+          </section>
+
+          <button
+            onClick={handleAnalyze}
+            disabled={!file || busy}
+            className="btn-primary btn-lg"
+          >
+            {analyzing ? "Extracting…" : "Extract tags"}
+          </button>
+          <p className="note">
+            Free and fast: scores the image against the tag vocabulary and
+            asks the judge to review it. Nothing is sent to Suno until you
+            generate.
+          </p>
+
+          {error && <p className="status-error">{error}</p>}
+          {notice && <p className="status-notice">{notice}</p>}
+
+          {history.length > 0 && (
+            <div className="danger-zone">
+              <button
+                onClick={handleWipe}
+                disabled={busy}
+                className={`btn-sm btn-danger${armed ? " is-armed" : ""}`}
+              >
+                {armed
+                  ? `Delete ${history.length} runs? Click again`
+                  : "Clear history"}
+              </button>
+              <p className="note">
+                Deletes every saved image and MP3. Nothing is backed up.
+              </p>
+            </div>
+          )}
+        </div>
+
+        <div className="info-card">
+          <h2 className="section-title">How the tagging works</h2>
+          <ol className="info-steps">
+            <li>
+              The picked algorithm ({algorithmLabel}) embeds the image and
+              scores it against a fixed vocabulary of adjectives grouped into
+              8 facets: color, light, mood, valence, arousal, texture,
+              energy, style.
+            </li>
+            <li>
+              A per-facet quota (2 color, 1 light, 3 mood, 1 valence, 1
+              arousal, 2 texture, 1 energy, 1 style) picks the top-scoring
+              words from each facet, so the 10 tags stay diverse instead of
+              collapsing onto one idea and its synonyms.
+            </li>
+            <li>
+              Claude reviews the 10 tags against the image and flags any that
+              read as flatly wrong for its mood; each flagged tag is swapped
+              for the next-best word in the same facet.
+            </li>
+            <li>
+              The final tags, plus an optional genre, become the prompt sent
+              to Suno to render the song.
+            </li>
+          </ol>
+        </div>
+
+        <div className="genre-card">
+          <h2 className="section-title">
+            Genre <span className="meta-label">(optional, just for fun)</span>
+          </h2>
+          <p className="note">
+            Adds a style hint to the Suno prompt -- it doesn&rsquo;t change
+            which algorithm scores the image or which tags it picks.
+          </p>
+
           <section className="genre">
-            <GenreKnob
-              genres={genres}
+            <SpinKnob
+              options={genres}
               value={genre}
               onChange={setQuery}
+              label="Genre"
               disabled={busy}
             />
 
             <div className="genre-fields">
               <label htmlFor="genre-search" className="genre-label">
-                Genre <span className="meta-label">(optional)</span>
+                Genre
               </label>
 
               <input
@@ -744,65 +914,6 @@ export default function Home() {
               </p>
             </div>
           </section>
-
-          <button
-            onClick={handleAnalyze}
-            disabled={!file || busy}
-            className="btn-primary btn-lg"
-          >
-            {analyzing ? "Extracting…" : "Extract tags"}
-          </button>
-          <p className="note">
-            Free and fast: scores the image against the tag vocabulary and
-            asks the judge to review it. Nothing is sent to Suno until you
-            generate.
-          </p>
-
-          {error && <p className="status-error">{error}</p>}
-          {notice && <p className="status-notice">{notice}</p>}
-
-          {history.length > 0 && (
-            <div className="danger-zone">
-              <button
-                onClick={handleWipe}
-                disabled={busy}
-                className={`btn-sm btn-danger${armed ? " is-armed" : ""}`}
-              >
-                {armed
-                  ? `Delete ${history.length} runs? Click again`
-                  : "Clear history"}
-              </button>
-              <p className="note">
-                Deletes every saved image and MP3. Nothing is backed up.
-              </p>
-            </div>
-          )}
-        </div>
-
-        <div className="info-card">
-          <h2 className="section-title">How the tagging works</h2>
-          <ol className="info-steps">
-            <li>
-              SigLIP embeds the image and scores it against a fixed
-              vocabulary of adjectives grouped into 8 facets: color, light,
-              mood, valence, arousal, texture, energy, style.
-            </li>
-            <li>
-              A per-facet quota (2 color, 1 light, 3 mood, 1 valence, 1
-              arousal, 2 texture, 1 energy, 1 style) picks the top-scoring
-              words from each facet, so the 10 tags stay diverse instead of
-              collapsing onto one idea and its synonyms.
-            </li>
-            <li>
-              Claude reviews the 10 tags against the image and flags any that
-              read as flatly wrong for its mood; each flagged tag is swapped
-              for the next-best word in the same facet.
-            </li>
-            <li>
-              The final tags, plus an optional genre, become the prompt sent
-              to Suno to render the song.
-            </li>
-          </ol>
         </div>
       </div>
 
@@ -812,10 +923,10 @@ export default function Home() {
             <div className="run-head">
               <span className="run-head-text">
                 <span className="run-name">
-                  Tag Analysis: SigLIP joint embedding
+                  Tag Analysis: {algorithmLabel} joint embedding
                 </span>
                 <span className="run-stamp">
-                  {genre || "no genre"} · not generated yet
+                  {algorithmLabel} · {genre || "no genre"} · not generated yet
                 </span>
               </span>
             </div>
@@ -831,6 +942,8 @@ export default function Home() {
                 tagScores={analysis.tag_scores}
                 tagging={analysis.tagging}
                 prompt={analysis.prompt}
+                algorithm={analysis.algorithm}
+                algorithmLabel={algorithmLabels[analysis.algorithm] ?? analysis.algorithm}
               />
 
               <div className="actions">
@@ -899,6 +1012,10 @@ export default function Home() {
                     </span>
                     <span className="run-stamp">
                       {new Date(entry.timestamp).toLocaleString()}
+                      {" · "}
+                      {algorithmLabels[entry.algorithm ?? "siglip"] ??
+                        entry.algorithm ??
+                        "SigLIP"}
                       {entry.genre && ` · ${entry.genre}`}
                     </span>
                   </span>
@@ -922,6 +1039,12 @@ export default function Home() {
                       tagScores={entry.tag_scores}
                       tagging={entry.tagging}
                       prompt={entry.prompt}
+                      algorithm={entry.algorithm ?? "siglip"}
+                      algorithmLabel={
+                        algorithmLabels[entry.algorithm ?? "siglip"] ??
+                        entry.algorithm ??
+                        "SigLIP"
+                      }
                     />
 
                     {entry.tracks.map((track, index) => (

@@ -1,30 +1,31 @@
 """Phase 1 of vocabulary_optimizer.md: facet-consistency check.
 
-Embeds every word in vocabulary.ADJECTIVES (the same way siglip_tagger already
-does) and, for each word, finds its nearest neighbors across the *entire*
-vocabulary rather than just its own facet. A word whose neighbors mostly live
-in a different facet is a candidate for reassignment -- reported as a
+Embeds every word in vocabulary.ADJECTIVES (the same way embedding_tagger already
+does for SigLIP) and, for each word, finds its nearest neighbors across the
+*entire* vocabulary rather than just its own facet. A word whose neighbors mostly
+live in a different facet is a candidate for reassignment -- reported as a
 before/after pair, never applied automatically. Command-line dev tool, not
-called by the app; run manually from backend/.
+called by the app; run manually from backend/. SigLIP-only -- the vocabulary was
+only ever tuned against SigLIP, so this doesn't check the other 4 algorithms.
 
 Usage: backend/.venv/bin/python check_facets.py
 """
 
 import torch
 
-import siglip_tagger as st
+import embedding_tagger as et
 from vocabulary import ADJECTIVES
 
 TOP_K = 5
 
 
 def main() -> None:
-    st._load()  # populates st._text_vectors without needing an image
+    et._load("siglip")  # populates the SigLIP state's text_vectors without needing an image
 
     words: list[str] = []
     facets: list[str] = []
     vectors: list[torch.Tensor] = []
-    for facet, vecs in st._text_vectors.items():
+    for facet, vecs in et._state["siglip"].text_vectors.items():
         for i, word in enumerate(ADJECTIVES[facet]):
             words.append(word)
             facets.append(facet)

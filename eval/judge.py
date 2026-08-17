@@ -20,7 +20,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# backend/ is a sibling directory, not a package, and siglip_tagger.py does a bare
+# backend/ is a sibling directory, not a package, and embedding_tagger.py does a bare
 # `from vocabulary import ...` that only resolves if backend/ is on sys.path.
 BACKEND_DIR = Path(__file__).parent.parent / "backend"
 sys.path.insert(0, str(BACKEND_DIR))
@@ -30,7 +30,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 # the environment by then, not after.
 load_dotenv(BACKEND_DIR / ".env")
 
-from siglip_tagger import siglip_tags  # noqa: E402
+from embedding_tagger import siglip_tags  # noqa: E402
 from judge import judge_image  # noqa: E402
 
 REPO_ROOT = Path(__file__).parent.parent

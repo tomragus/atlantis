@@ -2,18 +2,23 @@
 
 import { useRef, useState } from "react";
 
-// How far the knob turns per genre. 12° means a full turn covers 30 genres, which
+// How far the knob turns per option. 12° means a full turn covers 30 options, which
 // is fast enough to browse without being twitchy.
-const DEGREES_PER_GENRE = 12;
+const DEGREES_PER_OPTION = 12;
 
 type Props = {
-  genres: string[];
+  options: string[];
   value: string;
-  onChange: (genre: string) => void;
+  onChange: (option: string) => void;
+  label: string;
   disabled?: boolean;
 };
 
-export default function GenreKnob({ genres, value, onChange, disabled }: Props) {
+// A drag/keyboard-driven picker over a flat list of string options, originally
+// built for the genre picker and generalized to drive the algorithm selector too
+// -- both need the same "spin to browse, snap to the nearest option" behavior,
+// just over a different list and with independent state.
+export default function SpinKnob({ options, value, onChange, label, disabled }: Props) {
   const [rotation, setRotation] = useState(0);
   const [seenValue, setSeenValue] = useState(value);
   const knob = useRef<HTMLDivElement>(null);
@@ -21,24 +26,24 @@ export default function GenreKnob({ genres, value, onChange, disabled }: Props) 
   const lastAngle = useRef<number | null>(null);
 
   const indexAt = (degrees: number) => {
-    const count = genres.length;
+    const count = options.length;
     if (count === 0) return 0;
     // Modulo twice so negative rotations wrap round to the end of the list rather
     // than producing a negative index.
-    const step = Math.round(degrees / DEGREES_PER_GENRE) % count;
+    const step = Math.round(degrees / DEGREES_PER_OPTION) % count;
     return (step + count) % count;
   };
 
-  // Snap round when something else (search, dice, clear) changed the genre. This
+  // Snap round when something else (search, dice, clear) changed the value. This
   // adjusts state during render rather than in an effect, which is React's
   // recommended shape for "derive from a prop that changed" and avoids the extra
   // paint an effect would cause. The guard means it never fights a live drag,
   // because during a drag the knob and the value already agree.
   if (value !== seenValue) {
     setSeenValue(value);
-    const target = genres.indexOf(value);
-    if (target >= 0 && genres[indexAt(rotation)] !== value) {
-      setRotation(target * DEGREES_PER_GENRE);
+    const target = options.indexOf(value);
+    if (target >= 0 && options[indexAt(rotation)] !== value) {
+      setRotation(target * DEGREES_PER_OPTION);
     }
   }
 
@@ -51,7 +56,7 @@ export default function GenreKnob({ genres, value, onChange, disabled }: Props) 
 
   function turnTo(degrees: number) {
     setRotation(degrees);
-    if (genres.length > 0) onChange(genres[indexAt(degrees)]);
+    if (options.length > 0) onChange(options[indexAt(degrees)]);
   }
 
   function handlePointerDown(event: React.PointerEvent) {
@@ -76,7 +81,7 @@ export default function GenreKnob({ genres, value, onChange, disabled }: Props) 
     knob.current?.releasePointerCapture(event.pointerId);
   }
 
-  // Arrow keys step one genre, so the knob is usable without a mouse.
+  // Arrow keys step one option, so the knob is usable without a mouse.
   function handleKeyDown(event: React.KeyboardEvent) {
     if (disabled) return;
     const step =
@@ -87,17 +92,17 @@ export default function GenreKnob({ genres, value, onChange, disabled }: Props) 
           : 0;
     if (step === 0) return;
     event.preventDefault();
-    turnTo(rotation + step * DEGREES_PER_GENRE);
+    turnTo(rotation + step * DEGREES_PER_OPTION);
   }
 
   return (
     <div
       ref={knob}
       role="slider"
-      aria-label="Genre"
+      aria-label={label}
       aria-valuemin={0}
-      aria-valuemax={Math.max(genres.length - 1, 0)}
-      aria-valuenow={Math.max(genres.indexOf(value), 0)}
+      aria-valuemax={Math.max(options.length - 1, 0)}
+      aria-valuenow={Math.max(options.indexOf(value), 0)}
       aria-valuetext={value || "none"}
       aria-disabled={disabled}
       tabIndex={disabled ? -1 : 0}
