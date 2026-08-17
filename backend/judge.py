@@ -30,7 +30,7 @@ JUDGE_MAX_SIDE = 1024
 JUDGE_PROMPT_TEMPLATE = """You are reviewing the output of an automated image-tagging system.
 
 The system looked at this image and picked these {tag_count} one-word adjectives -- \
-covering colour, lighting, mood, emotional valence, emotional arousal, texture, energy, \
+covering color, lighting, mood, emotional valence, emotional arousal, texture, energy, \
 and visual style -- to feed a music generator that will turn this image into a song:
 
 {tag_list}
@@ -49,7 +49,7 @@ the image conjures, not asserting the leaves are literally in motion. Give the t
 benefit of the doubt -- more than you might instinctively want to. Only flag a word when \
 it is flatly contradicted by the image's mood, to the point that almost any viewer would \
 call it simply wrong -- e.g. "aquatic" for a desert photo, or "joyful" for a scene that \
-is unambiguously grim. Being static, showing the "wrong" literal colour, or otherwise not \
+is unambiguously grim. Being static, showing the "wrong" literal color, or otherwise not \
 literally depicting the word is NOT, on its own, a reason to flag. If you're genuinely \
 unsure whether a word fits, do not flag it.
 

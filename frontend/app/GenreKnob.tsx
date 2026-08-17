@@ -44,9 +44,9 @@ export default function GenreKnob({ genres, value, onChange, disabled }: Props) 
 
   function angleOfPointer(clientX: number, clientY: number) {
     const box = knob.current!.getBoundingClientRect();
-    const centreX = box.left + box.width / 2;
-    const centreY = box.top + box.height / 2;
-    return (Math.atan2(clientY - centreY, clientX - centreX) * 180) / Math.PI;
+    const centerX = box.left + box.width / 2;
+    const centerY = box.top + box.height / 2;
+    return (Math.atan2(clientY - centerY, clientX - centerX) * 180) / Math.PI;
   }
 
   function turnTo(degrees: number) {
@@ -111,9 +111,9 @@ export default function GenreKnob({ genres, value, onChange, disabled }: Props) 
         height: 120,
         flexShrink: 0,
         borderRadius: "50%",
-        border: "2px solid var(--ink)",
-        background: "var(--yellow)",
-        boxShadow: "var(--lift-sm)",
+        border: "1px solid var(--line-strong)",
+        background: "var(--paper-dim)",
+        boxShadow: "var(--shadow-sm)",
         position: "relative",
         display: "flex",
         alignItems: "center",
@@ -132,9 +132,9 @@ export default function GenreKnob({ genres, value, onChange, disabled }: Props) 
           left: "50%",
           width: 4,
           height: 18,
-          background: "var(--orange-deep)",
+          background: "var(--accent)",
           borderRadius: 2,
-          // 54px is the distance from the marker's own top to the knob's centre.
+          // 54px is the distance from the marker's own top to the knob's center.
           transformOrigin: "50% 54px",
           transform: `translateX(-50%) rotate(${rotation}deg)`,
         }}

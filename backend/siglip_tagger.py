@@ -135,6 +135,52 @@ def siglip_tags_by_facet(image_bytes: bytes) -> dict[str, list[tuple[str, float]
     return ranked
 
 
+def embedding_projection(image_bytes: bytes, points: list[tuple[str, str]]) -> dict:
+    """2D PCA layout of the given (word, facet) points, with the image vector
+    projected onto that same basis.
+
+    Illustrative, not analytic: SigLIP's real embedding space is far higher-
+    dimensional (768-d here), so collapsing it to a plane necessarily distorts
+    relative distances -- two points that land close together on this plot
+    aren't guaranteed to be the two closest in the actual space. This exists
+    for the tag-analysis scatter plot only; nothing about tag selection or
+    ranking reads from it.
+
+    The PCA basis is fit on the word vectors alone, not the image. SigLIP (like
+    CLIP) has a well-documented "modality gap" -- image and text embeddings
+    occupy visibly separate regions of the space -- so an image vector sits far
+    outside the tag cluster on almost every request. Including it in the fit
+    would spend both components chasing that one outlier and collapse the 20
+    tags, which are the part worth actually resolving, into an unreadable
+    smear. The frontend clamps the projected image point to the plot's edge
+    when it falls outside the tags' bounds rather than rescaling around it.
+    """
+    _load()
+
+    image_vector = _embed_image(image_bytes)  # 1 x D
+    word_vectors = torch.stack(
+        [_text_vectors[facet][ADJECTIVES[facet].index(word)] for word, facet in points]
+    )  # N x D
+
+    mean = word_vectors.mean(dim=0, keepdim=True)
+    centered_words = word_vectors - mean
+    _, _, v = torch.pca_lowrank(centered_words, q=2)
+    basis = v[:, :2]
+
+    word_coords = (centered_words @ basis).tolist()
+    image_x, image_y = ((image_vector - mean) @ basis).squeeze(0).tolist()
+
+    return {
+        "model": MODEL_ID,
+        "source_dimensions": word_vectors.shape[-1],
+        "image": {"x": image_x, "y": image_y},
+        "points": [
+            {"tag": word, "facet": facet, "x": x, "y": y}
+            for (word, facet), (x, y) in zip(points, word_coords)
+        ],
+    }
+
+
 def _ordered_by_score(tags: list[str], scores: dict[str, float]) -> tuple[list[str], dict[str, float]]:
     """Sorts tags best-first and rebuilds the score dict to match that order.
 
@@ -161,30 +207,45 @@ def select_tags(ranked: dict[str, list[tuple[str, float]]]) -> tuple[list[str], 
     return _ordered_by_score(tags, scores)
 
 
+def word_to_facet(ranked: dict[str, list[tuple[str, float]]]) -> dict[str, str]:
+    """Flattens the ranked-by-facet structure into a word -> facet lookup.
+
+    Shared by `replace_flagged_tags` below and main.py's tagging summary --
+    both need to know which facet a given word came from.
+    """
+    return {word: facet for facet, candidates in ranked.items() for word, _ in candidates}
+
+
 def replace_flagged_tags(
     ranked: dict[str, list[tuple[str, float]]],
     tags: list[str],
     scores: dict[str, float],
     flagged: set[str],
-) -> tuple[list[str], dict[str, float]]:
+) -> tuple[list[str], dict[str, float], dict[str, str]]:
     """Swaps each flagged tag for the next-best unused word in its own facet.
 
     Same-facet rather than a flat nearest-match, so a flagged mood word is
-    replaced by another mood word and the quota mix (colour:2, light:1, mood:3,
+    replaced by another mood word and the quota mix (color:2, light:1, mood:3,
     texture:2, energy:1, style:1) never skews. If a facet's candidates are all
     already in use, the original tag is kept rather than dropped.
+
+    The third return value maps each flagged tag that was actually swapped to
+    its replacement -- callers that surface the judging process (main.py's
+    history record) use it to show what replaced what. Tags kept despite being
+    flagged (facet exhausted) are omitted from this mapping.
     """
-    word_to_facet = {word: facet for facet, candidates in ranked.items() for word, _ in candidates}
+    facet_of = word_to_facet(ranked)
     used = set(tags)
 
     new_tags: list[str] = []
     new_scores = dict(scores)
+    replacements: dict[str, str] = {}
     for tag in tags:
         if tag not in flagged:
             new_tags.append(tag)
             continue
 
-        facet = word_to_facet[tag]
+        facet = facet_of[tag]
         replacement = next((c for c in ranked[facet] if c[0] not in used), None)
         if replacement is None:
             # Every candidate in this facet is already in the tag list -- the
@@ -199,8 +260,10 @@ def replace_flagged_tags(
         used.add(word)
         new_tags.append(word)
         new_scores[word] = score
+        replacements[tag] = word
 
-    return _ordered_by_score(new_tags, new_scores)
+    new_tags, new_scores = _ordered_by_score(new_tags, new_scores)
+    return new_tags, new_scores, replacements
 
 
 def siglip_tags(image_bytes: bytes) -> tuple[list[str], dict[str, float]]:

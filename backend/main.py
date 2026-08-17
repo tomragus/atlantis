@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -164,6 +164,7 @@ def save_to_history(
     prompt: str,
     job: dict,
     genre: str,
+    tagging: dict,
 ) -> dict:
     """Writes the image, every take Suno rendered, and one JSONL row for the run.
 
@@ -221,6 +222,7 @@ def save_to_history(
         "genre": genre,
         "tags": tags,
         "tag_scores": tag_scores,
+        "tagging": tagging,
         "prompt": prompt,
         "job_id": job["id"],
         "tracks": tracks,
@@ -283,11 +285,73 @@ def list_genres() -> list[str]:
     return GENRES
 
 
-@app.post("/generate")
-def generate(image: UploadFile = File(...), genre: str = ""):
+def build_tagging_summary(
+    ranked: dict,
+    selected_tags: list[str],
+    selected_scores: dict,
+    verdicts: list[dict],
+    final_tags: list[str],
+    final_scores: dict,
+    replacements: dict,
+) -> dict:
+    """Assembles everything the frontend needs to show how the 10 tags were picked.
+
+    `ranked` already holds every candidate word per facet (see
+    `siglip_tags_by_facet`), so this is pure bookkeeping: no re-scoring.
+    """
+    # Deferred like the other siglip_tagger imports in `tag()` below -- this
+    # function is only ever called from there, after torch is already loaded,
+    # but importing it lazily here too keeps `build_tagging_summary` correct
+    # to call on its own rather than relying on caller-side import ordering.
+    from siglip_tagger import word_to_facet
+
+    facet_of = word_to_facet(ranked)
+
+    top20 = sorted(
+        (
+            {"tag": word, "facet": facet, "score": score}
+            for facet, candidates in ranked.items()
+            for word, score in candidates
+        ),
+        key=lambda entry: entry["score"],
+        reverse=True,
+    )[:20]
+
+    return {
+        "top20": top20,
+        "selected": [
+            {"tag": tag, "facet": facet_of[tag], "score": selected_scores[tag]}
+            for tag in selected_tags
+        ],
+        "judge": verdicts,
+        "final": [
+            {"tag": tag, "facet": facet_of[tag], "score": final_scores[tag]}
+            for tag in final_tags
+        ],
+        "replacements": [
+            {"from": old, "to": new} for old, new in replacements.items()
+        ],
+    }
+
+
+@app.post("/tag")
+def tag(image: UploadFile = File(...), genre: str = ""):
+    """Runs the tagging half of the pipeline only: SigLIP scoring + the judge.
+
+    No Suno call and nothing saved to history -- this is the free, fast preview
+    that lets a user see (and the judge react to) an image's tags before they
+    commit to actually rendering a song. `/generate` below takes this response's
+    tags/tag_scores/tagging/prompt straight back so the judge never runs twice
+    for the same image.
+    """
     # Imported here rather than at module level so `import main` stays fast and
     # torch/anthropic are only loaded once an actual request needs them.
-    from siglip_tagger import siglip_tags_by_facet, select_tags, replace_flagged_tags
+    from siglip_tagger import (
+        siglip_tags_by_facet,
+        select_tags,
+        replace_flagged_tags,
+        embedding_projection,
+    )
     from judge import judge_image
 
     if genre and genre not in GENRES:
@@ -296,25 +360,66 @@ def generate(image: UploadFile = File(...), genre: str = ""):
     image_bytes = read_image(image)
     ranked = siglip_tags_by_facet(image_bytes)
     tags, tag_scores = select_tags(ranked)
+    selected_tags, selected_scores = tags, tag_scores
 
     # The judge is a quality improvement, not a hard dependency: if the Claude
     # call errors (rate limit, timeout, missing key), fall back to the untouched
     # SigLIP tags rather than failing a request that Suno could still render.
+    verdicts: list[dict] = []
+    replacements: dict[str, str] = {}
     try:
         verdicts = judge_image(image_bytes, tags)
         flagged = {v["tag"] for v in verdicts if v["flagged"]}
         if flagged:
-            tags, tag_scores = replace_flagged_tags(ranked, tags, tag_scores, flagged)
+            tags, tag_scores, replacements = replace_flagged_tags(
+                ranked, tags, tag_scores, flagged
+            )
     except Exception as exc:
         print(f"judge call failed, using unjudged SigLIP tags: {exc}")
+
+    tagging = build_tagging_summary(
+        ranked, selected_tags, selected_scores, verdicts, tags, tag_scores, replacements
+    )
+    tagging["embedding"] = embedding_projection(
+        image_bytes, [(point["tag"], point["facet"]) for point in tagging["top20"]]
+    )
 
     # The genre leads the prompt rather than using Suno's `style` parameter,
     # which is its documented home but made no audible difference in testing.
     prompt = ", ".join([prompt_term(genre), *tags] if genre else tags)
+
+    return {"tags": tags, "tag_scores": tag_scores, "tagging": tagging, "prompt": prompt}
+
+
+@app.post("/generate")
+def generate(
+    image: UploadFile = File(...),
+    genre: str = "",
+    tags: str = Form(...),
+    tag_scores: str = Form(...),
+    tagging: str = Form(...),
+    prompt: str = Form(...),
+):
+    """Renders and saves a song from a `/tag` response the frontend already has.
+
+    Deliberately does no tagging of its own -- the image, tags, and judge
+    verdicts were already settled in `/tag`, so this step is Suno + history only.
+    """
+    if genre and genre not in GENRES:
+        raise HTTPException(400, f"Unknown genre {genre!r}. See GET /genres.")
+
+    image_bytes = read_image(image)
     job = request_song(prompt)
 
     return save_to_history(
-        image_bytes, image.content_type, tags, tag_scores, prompt, job, genre
+        image_bytes,
+        image.content_type,
+        json.loads(tags),
+        json.loads(tag_scores),
+        prompt,
+        job,
+        genre,
+        json.loads(tagging),
     )
 
 

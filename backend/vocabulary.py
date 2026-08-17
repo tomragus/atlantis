@@ -14,8 +14,8 @@ warmth, hot, golden, sunny...).
 """
 
 ADJECTIVES = {
-    "colour": [
-        "crimson", "scarlet", "amber", "golden", "ochre", "russet", "sepia",
+    "color": [
+        "crimson", "scarlet", "amber", "golden", "ocher", "russet", "sepia",
         "teal", "cyan", "azure", "cobalt", "indigo", "violet", "magenta",
         "rosy", "coral", "peach", "olive", "emerald", "jade", "mint",
         "mustard", "lavender", "charcoal", "slate", "ashen", "ivory",
@@ -52,7 +52,7 @@ ADJECTIVES = {
     "valence": [
         "joyful", "hopeful", "carefree", "buoyant", "warm",
         "content", "elated",
-        "melancholy", "sombre", "bitter", "grim",
+        "melancholy", "somber", "bitter", "grim",
         "wretched", "dismal",
     ],
     # Calm <-> excited emotional activation, independent of valence (an image
@@ -94,7 +94,7 @@ ADJECTIVES = {
         "geometric", "organic", "abstract", "surreal", "photographic",
         "documentary", "editorial", "kitsch", "psychedelic", "gothic",
         "brutalist", "bohemian", "folkloric", "cyberpunk", "impressionistic",
-        "expressionistic", "naturalistic", "stylised", "cartoonish", "glitchy",
+        "expressionistic", "naturalistic", "stylized", "cartoonish", "glitchy",
         "analog", "digital", "utilitarian", "theatrical",
     ],
 }
@@ -105,7 +105,7 @@ ADJECTIVES = {
 # can't drift to covering only one axis of feeling (e.g. three mood words
 # that are all low-arousal, saying nothing about how activated the image is).
 QUOTAS = {
-    "colour": 2,
+    "color": 2,
     "light": 1,
     "mood": 3,
     "valence": 1,
