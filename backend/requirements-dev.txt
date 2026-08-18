@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Test runner only. httpx (needed by FastAPI's TestClient) already comes in
+# transitively via anthropic, so it isn't listed again here.
+pytest

@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import time
@@ -42,6 +43,11 @@ HISTORY_DIR = Path(__file__).parent / "history"
 AUDIO_DIR = HISTORY_DIR / "audio"
 
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+# The repo-root sample image set (also used by eval/judge.py), served so the
+# frontend's "select an image" grid can offer them without the user needing
+# their own file.
+TEST_IMAGES_DIR = Path(__file__).parent.parent / "test-images"
 
 # The Next.js dev server is a different origin, which browsers block by default.
 app.add_middleware(
@@ -269,6 +275,26 @@ def list_algorithms() -> list[dict]:
     return [{"id": algorithm, **ALGORITHM_INFO[algorithm]} for algorithm in ALGORITHMS]
 
 
+def known_sample_images() -> set[str]:
+    """Every filename /tag's `sample_image` param is allowed to name.
+
+    Shared by `list_test_images` (the picker's listing) and `tag`'s own
+    validation below, so the two can't drift out of sync -- a filename the
+    grid offers is always one `tag` will accept, and vice versa.
+    """
+    return {p.name for p in TEST_IMAGES_DIR.glob("*.png")}
+
+
+@app.get("/test-images")
+def list_test_images() -> list[str]:
+    """Filenames in test-images/, for the frontend's sample-image grid.
+
+    Sorted so the grid order is stable across requests; served from
+    `/test-image-files/<name>` (mounted below) rather than this route.
+    """
+    return sorted(known_sample_images())
+
+
 def build_tagging_summary(
     ranked: dict,
     facet_of: dict,
@@ -323,7 +349,13 @@ def build_tagging_summary(
 
 
 @app.post("/tag")
-def tag(image: UploadFile = File(...), genre: str = "", algorithm: str = "siglip"):
+def tag(
+    image: UploadFile | None = File(None),
+    sample_image: str = "",
+    genre: str = "",
+    algorithm: str = "siglip",
+    judges: bool = True,
+):
     """Runs the tagging half of the pipeline only: embedding scoring + the judge.
 
     No Suno call and nothing saved to history -- this is the free, fast preview
@@ -331,6 +363,21 @@ def tag(image: UploadFile = File(...), genre: str = "", algorithm: str = "siglip
     commit to actually rendering a song. `/generate` below takes this response's
     tags/tag_scores/tagging/prompt straight back so the judge never runs twice
     for the same image.
+
+    `judges=False` skips both Claude judge passes entirely (no call made,
+    not just an ignored result) -- the frontend's LLM-judges toggle, for
+    when a user wants the embedding tags as-is without the extra Claude
+    cost/latency. Tags are then exactly `select_tags`'s output.
+
+    Exactly one of `image` (an upload) or `sample_image` (a filename from
+    `GET /test-images`) must be given -- both or neither is a 400, not a
+    silent pick-one, so a caller can't have an upload quietly ignored in
+    favor of a sample image it didn't ask for. `sample_image` is read
+    straight off disk here rather than the frontend fetching its bytes
+    itself and re-uploading them as `image` -- that would need a
+    cross-origin GET of the raw bytes to succeed under whatever CORS policy
+    the browser is enforcing, which the frontend's own POSTs to this same
+    endpoint don't require. Reading server-side sidesteps that entirely.
     """
     # Imported here rather than at module level so `import main` stays fast and
     # torch/anthropic are only loaded once an actual request needs them.
@@ -349,7 +396,21 @@ def tag(image: UploadFile = File(...), genre: str = "", algorithm: str = "siglip
     validate_genre(genre)
     validate_algorithm(algorithm)
 
-    image_bytes = read_image(image)
+    if sample_image and image is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either an uploaded image or a sample_image filename, not both.",
+        )
+    elif sample_image:
+        if sample_image not in known_sample_images():
+            raise HTTPException(status_code=400, detail=f"Unknown sample image: {sample_image}")
+        image_bytes = (TEST_IMAGES_DIR / sample_image).read_bytes()
+        image_content_type = "image/png"
+    elif image is not None:
+        image_bytes = read_image(image)
+        image_content_type = image.content_type
+    else:
+        raise HTTPException(status_code=400, detail="Provide either an uploaded image or a sample_image filename.")
     # Computed once and reused below for the embedding-space plot -- tags_by_facet
     # and embedding_projection both need this image's vector, and it's the same
     # vector either way (same image, same algorithm), so there's no reason to run
@@ -367,13 +428,14 @@ def tag(image: UploadFile = File(...), genre: str = "", algorithm: str = "siglip
     # saying the word doesn't belong, not that some other word from the same
     # facet does, so the tag list just gets shorter.
     verdicts: list[dict] = []
-    try:
-        verdicts = judge_image(image_bytes, tags)
-        flagged = {v["tag"] for v in verdicts if v["flagged"]}
-        if flagged:
-            tags, tag_scores = drop_flagged_tags(tags, tag_scores, flagged)
-    except Exception as exc:
-        print(f"judge call failed, using unjudged tags: {exc}")
+    if judges:
+        try:
+            verdicts = judge_image(image_bytes, tags)
+            flagged = {v["tag"] for v in verdicts if v["flagged"]}
+            if flagged:
+                tags, tag_scores = drop_flagged_tags(tags, tag_scores, flagged)
+        except Exception as exc:
+            print(f"judge call failed, using unjudged tags: {exc}")
 
     # Second pass: the per-tag judge above scores each tag in isolation, so it
     # can't catch two tags from different facets that contradict each other's
@@ -382,13 +444,14 @@ def tag(image: UploadFile = File(...), genre: str = "", algorithm: str = "siglip
     # contract and same drop-outright behavior -- this judge only decides
     # *which* tag of a contradicting pair to drop.
     contradictions: list[dict] = []
-    try:
-        contradictions = judge_contradictions(tags, facet_of)
-        drop = {c["drop"] for c in contradictions}
-        if drop:
-            tags, tag_scores = drop_flagged_tags(tags, tag_scores, drop)
-    except Exception as exc:
-        print(f"contradiction judge call failed, using tags as-is: {exc}")
+    if judges:
+        try:
+            contradictions = judge_contradictions(tags, facet_of)
+            drop = {c["drop"] for c in contradictions}
+            if drop:
+                tags, tag_scores = drop_flagged_tags(tags, tag_scores, drop)
+        except Exception as exc:
+            print(f"contradiction judge call failed, using tags as-is: {exc}")
 
     tagging = build_tagging_summary(
         ranked,
@@ -397,6 +460,20 @@ def tag(image: UploadFile = File(...), genre: str = "", algorithm: str = "siglip
         contradictions,
         tags,
         tag_scores,
+    )
+    # Lets the frontend tell "judges ran and flagged nothing" apart from
+    # "judges were skipped" -- both look identical as empty `judge`/
+    # `contradictions` lists otherwise.
+    tagging["judges_enabled"] = judges
+    # The image as a data URI, so the frontend's downloadable tag-analysis
+    # report can embed it directly without a second fetch -- an uploaded
+    # image the frontend already has as a File, and a sample_image URL that
+    # (per the docstring above) deliberately never gets fetched client-side.
+    # Duplicating these bytes across all 5 responses in Suite mode is wasteful
+    # bandwidth, but each request tags one image locally, not at any scale
+    # where that matters.
+    tagging["image_data_url"] = (
+        f"data:{image_content_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
     )
     tagging["embedding"] = embedding_projection(
         image_bytes,
@@ -465,3 +542,8 @@ def generate(
 # Serves the saved images and MP3s, so the frontend can play a song from local
 # disk rather than depending on apiframe's CDN still holding it.
 app.mount("/files", StaticFiles(directory=HISTORY_DIR), name="files")
+
+# Serves the sample images themselves; GET /test-images above only lists names.
+app.mount(
+    "/test-image-files", StaticFiles(directory=TEST_IMAGES_DIR), name="test-image-files"
+)

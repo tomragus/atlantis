@@ -72,10 +72,21 @@ type Tagging = {
   judge: JudgeVerdict[];
   contradictions: Contradiction[];
   final: FacetTag[];
+  // Whether this run actually invoked the Claude judges (the "LLM judges"
+  // toggle's value at request time) -- an empty `judge`/`contradictions`
+  // list looks the same whether the judges ran and flagged nothing, or
+  // never ran at all, so this is what tells those two cases apart.
+  judges_enabled: boolean;
   embedding?: Embedding;
   // CoCa-only: a free-text caption from its captioning head. Display-only --
   // never fed into tag selection or the Suno prompt.
   caption?: string;
+  // The tagged image itself, as a data: URI -- sent back by the backend
+  // (which already had the bytes in memory either way) so the downloadable
+  // tag-analysis report can embed it directly, without the frontend fetching
+  // it a second time. See main.py's `/tag` docstring for why that second
+  // fetch is deliberately avoided for a sample-picker image.
+  image_data_url: string;
 };
 
 // Fixed hue order for the 8 facets, never reassigned/cycled per-render --
@@ -166,24 +177,32 @@ async function apiRequest(
   }
 }
 
-// The frontend (localhost:3000) and backend (127.0.0.1:8000) are different
-// origins, so a plain `<a download href={fileUrl(...)}>` won't reliably
-// force a save -- browsers ignore the `download` attribute cross-origin and
-// just navigate instead. Fetching the audio as a blob first and saving
-// *that* via a temporary object URL works regardless of origin, since the
-// blob URL belongs to this page once created.
-async function downloadTrack(track: Track) {
-  const response = await fetch(fileUrl(track.audioFile));
-  if (!response.ok) throw new Error("Could not download the track.");
-  const blob = await response.blob();
+// Shared by every local-save action (a downloaded track, the tag-analysis
+// report): build a temporary object URL for the blob and click a hidden
+// link, since a blob's URL always belongs to this page regardless of where
+// the bytes came from.
+function downloadBlob(blob: Blob, filename: string) {
   const objectUrl = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = objectUrl;
-  link.download = track.audioFile.split("/").pop() ?? "track.mp3";
+  link.download = filename;
   document.body.appendChild(link);
   link.click();
   link.remove();
   URL.revokeObjectURL(objectUrl);
+}
+
+// The frontend (localhost:3000) and backend (127.0.0.1:8000) are different
+// origins, so a plain `<a download href={fileUrl(...)}>` won't reliably
+// force a save -- browsers ignore the `download` attribute cross-origin and
+// just navigate instead. Fetching the audio as a blob first and saving
+// *that* via downloadBlob works regardless of origin, since the blob URL
+// belongs to this page once created.
+async function downloadTrack(track: Track) {
+  const response = await fetch(fileUrl(track.audioFile));
+  if (!response.ok) throw new Error("Could not download the track.");
+  const blob = await response.blob();
+  downloadBlob(blob, track.audioFile.split("/").pop() ?? "track.mp3");
 }
 
 // Scores sit in a narrow band near zero (SigLIP's probabilities, and the other
@@ -195,6 +214,207 @@ function formatScore(score: number): string {
   if (!Number.isFinite(score) || score === 0) return "0.000";
   if (Math.abs(score) < 0.001) return score.toExponential(2);
   return score.toFixed(3);
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Which of a judge pass's verdicts actually get shown as a dropped tag, and
+// what to say about each -- the data-shaping both JudgeReviewSection (JSX,
+// in TagBreakdown below) and judgeListHtml (the HTML report, in
+// algorithmSectionHtml below) render. Kept in one place so a future change
+// to what counts as "flagged" or how a contradiction's reason reads can't
+// update one presentation and silently miss the other.
+type JudgeRow = { key: string; flaggedTag: string; reason: string };
+
+function flaggedJudgeRows(judge: JudgeVerdict[]): JudgeRow[] {
+  return judge
+    .filter((v) => v.flagged)
+    .map((v) => ({ key: v.tag, flaggedTag: v.tag, reason: v.reason }));
+}
+
+function contradictionRows(contradictions: Contradiction[]): JudgeRow[] {
+  return contradictions.map((c, index) => {
+    const kept = c.drop === c.tag_a ? c.tag_b : c.tag_a;
+    return {
+      key: `${c.tag_a}-${c.tag_b}-${index}`,
+      flaggedTag: c.drop,
+      reason: `contradicted “${kept}” -- ${c.reason}`,
+    };
+  });
+}
+
+function tagTableRows(tags: FacetTag[], selected?: Set<string>): string {
+  return tags
+    .map(
+      ({ tag, facet, score }) => `
+        <tr${selected && !selected.has(tag) ? ' class="muted"' : ""}>
+          <td>${escapeHtml(tag)}</td>
+          <td>${escapeHtml(facet)}</td>
+          <td class="mono">${formatScore(score)}</td>
+        </tr>`,
+    )
+    .join("");
+}
+
+function judgeListHtml(
+  rows: { flaggedTag: string; reason: string }[],
+  emptyMessage: string,
+): string {
+  if (rows.length === 0) return `<p class="empty">${escapeHtml(emptyMessage)}</p>`;
+  return `<ul class="judge-list">${rows
+    .map(
+      (row) => `
+        <li><span class="flagged">${escapeHtml(row.flaggedTag)}</span> dropped
+          ${row.reason ? `<div class="reason">${escapeHtml(row.reason)}</div>` : ""}
+        </li>`,
+    )
+    .join("")}</ul>`;
+}
+
+// One algorithm's full tag-analysis section: final tags, CoCa's caption (if
+// any), both judge passes' verdicts, the top-20 candidate pool, and the
+// prompt actually sent to Suno -- the same fields TagBreakdown renders in
+// the UI, just as static HTML instead of React.
+function algorithmSectionHtml(algorithmLabel: string, analysis: Analysis): string {
+  const { tagging, prompt } = analysis;
+  const finalTagNames = new Set(tagging.final.map((f) => f.tag));
+
+  return `
+    <section class="algo">
+      <h2>${escapeHtml(algorithmLabel)}</h2>
+
+      ${
+        tagging.final.length > 0
+          ? `<table class="tags"><thead><tr><th>tag</th><th>facet</th><th>score</th></tr></thead>
+             <tbody>${tagTableRows(tagging.final)}</tbody></table>`
+          : `<p class="empty">No tags survived judging.</p>`
+      }
+
+      ${
+        tagging.caption
+          ? `<p class="caption"><span class="label">caption</span> &ldquo;${escapeHtml(tagging.caption)}&rdquo;</p>`
+          : ""
+      }
+
+      <h3>Judge review 1 &mdash; poor-quality tags</h3>
+      ${judgeListHtml(
+        flaggedJudgeRows(tagging.judge),
+        tagging.judges_enabled ? "Judge #1 found no tags that didn't fit the image's mood this run." : "LLM judges skipped.",
+      )}
+
+      <h3>Judge review 2 &mdash; contradictions</h3>
+      ${judgeListHtml(
+        contradictionRows(tagging.contradictions),
+        tagging.judges_enabled ? "Judge #2 identified no contradictory tags this run." : "LLM judges skipped.",
+      )}
+
+      ${
+        tagging.top20.length > 0
+          ? `<h3>Top 20 candidates</h3>
+             <table class="tags"><thead><tr><th>tag</th><th>facet</th><th>score</th></tr></thead>
+             <tbody>${tagTableRows(tagging.top20, finalTagNames)}</tbody></table>`
+          : ""
+      }
+
+      ${prompt ? `<p class="prompt"><span class="label">prompt sent to Suno</span> <span class="mono">${escapeHtml(prompt)}</span></p>` : ""}
+    </section>`;
+}
+
+// Builds a single, self-contained HTML document of the current run's full
+// tag analysis across every algorithm -- everything TagBreakdown shows in
+// the UI, minus the embedding plot (a live canvas, not something worth
+// statically rendering here) and any generated audio (out of scope for a
+// *tag* analysis report). The image comes from an algorithm's own
+// `tagging.image_data_url` (a data: URI baked in by the backend -- see the
+// `Tagging` type above) rather than the frontend's own `previewUrl`, so
+// this file is genuinely self-contained: it opens correctly later even
+// with the backend closed or an uploaded file's blob: URL long gone.
+function buildReportHtml({
+  results,
+  runAlgorithms,
+  algorithmLabels,
+  genre,
+}: {
+  results: Record<string, RunResult>;
+  runAlgorithms: string[];
+  algorithmLabels: Record<string, string>;
+  genre: string;
+}): string {
+  const imageSrc = runAlgorithms
+    .map((id) => results[id]?.analysis?.tagging.image_data_url)
+    .find((url): url is string => Boolean(url));
+
+  const sections = runAlgorithms
+    .map((id) => {
+      const result = results[id];
+      const label = algorithmLabels[id] ?? id;
+      if (result?.status === "ready" && result.analysis) {
+        return algorithmSectionHtml(label, result.analysis);
+      }
+      if (result?.status === "error") {
+        return `<section class="algo"><h2>${escapeHtml(label)}</h2><p class="empty">Tagging failed: ${escapeHtml(result.error ?? "unknown error")}</p></section>`;
+      }
+      return "";
+    })
+    .join("");
+
+  const generated = new Date().toLocaleString();
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Atlantis tag analysis report</title>
+<style>
+  @page { margin: 1.5cm; }
+  body { font-family: Georgia, serif; color: #201d19; background: #faf8f3; }
+  h1 { font-size: 1.6rem; }
+  h2 { font-size: 1.15rem; border-top: 2px solid #201d19; padding-top: 0.75rem; margin-top: 2rem;
+       break-before: auto; break-after: avoid; }
+  h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; color: #5a544c;
+       margin-top: 1.25rem; margin-bottom: 0.4rem; break-after: avoid; }
+  .meta { color: #5a544c; font-size: 0.85rem; }
+  .cover-image { max-width: 100%; max-height: 24rem; display: block; margin: 1rem 0;
+                 border: 1px solid #ddd4c4; }
+  table.tags { border-collapse: collapse; width: 100%; font-size: 0.85rem; break-inside: avoid; }
+  table.tags th, table.tags td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #ddd4c4; }
+  table.tags tr.muted { color: #8c8579; }
+  .label { font-weight: 700; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.06em;
+           color: #8c8579; margin-right: 0.4rem; }
+  .mono { font-family: ui-monospace, Menlo, monospace; }
+  .empty { color: #8c8579; font-size: 0.85rem; font-style: italic; }
+  .judge-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+  .judge-list li { background: #f2e3dd; padding: 0.5rem 0.75rem; border-left: 3px solid #7a3226; font-size: 0.85rem;
+                   break-inside: avoid; }
+  .flagged { font-weight: 700; }
+  .reason { color: #5a544c; margin-top: 0.2rem; }
+  .caption, .prompt { font-size: 0.85rem; margin-top: 0.75rem; }
+</style>
+</head>
+<body>
+  <h1>Atlantis &mdash; tag analysis report</h1>
+  <p class="meta">Generated ${escapeHtml(generated)}${genre ? ` &middot; genre: ${escapeHtml(genre)}` : ""}</p>
+  ${imageSrc ? `<img class="cover-image" src="${escapeHtml(imageSrc)}" alt="">` : ""}
+  ${sections}
+</body>
+</html>`;
+}
+
+// downloadBlob, not window.print()/a native dialog -- an earlier version of
+// this feature drove the browser's print-to-PDF dialog instead, which
+// crashed inside a Cursor-embedded webview. A downloaded .html file the
+// user opens in their own browser sidesteps that entirely, and can still be
+// printed-to-PDF from there if wanted.
+function downloadReportHtml(html: string) {
+  const blob = new Blob([html], { type: "text/html" });
+  downloadBlob(blob, `atlantis-tag-report-${new Date().toISOString().slice(0, 10)}.html`);
 }
 
 const PLOT_WIDTH = 520;
@@ -534,24 +754,23 @@ function TagBreakdown({
       )}
 
       <JudgeReviewSection
-        title="judge review 1 -- mood fit"
-        emptyMessage="Judge #1 found no tags that didn't fit the image's mood this run."
-        rows={tagging.judge
-          .filter((v) => v.flagged)
-          .map((v) => ({ key: v.tag, flaggedTag: v.tag, reason: v.reason }))}
+        title="judge review 1 -- poor-quality tags"
+        emptyMessage={
+          tagging.judges_enabled
+            ? "Judge #1 found no tags that didn't fit the image's mood this run."
+            : "LLM judges skipped."
+        }
+        rows={flaggedJudgeRows(tagging.judge)}
       />
 
       <JudgeReviewSection
         title="judge review 2 -- contradictions"
-        emptyMessage="Judge #2 identified no contradictory tags this run."
-        rows={tagging.contradictions.map((c, index) => {
-          const kept = c.drop === c.tag_a ? c.tag_b : c.tag_a;
-          return {
-            key: `${c.tag_a}-${c.tag_b}-${index}`,
-            flaggedTag: c.drop,
-            reason: `contradicted “${kept}” -- ${c.reason}`,
-          };
-        })}
+        emptyMessage={
+          tagging.judges_enabled
+            ? "Judge #2 identified no contradictory tags this run."
+            : "LLM judges skipped."
+        }
+        rows={contradictionRows(tagging.contradictions)}
       />
 
       {tagging.top20.length > 0 && (
@@ -704,11 +923,27 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const genre = genres.includes(query) ? query : "";
 
+  // Whether /tag runs its two Claude judge passes for the run about to
+  // start. On by default; off skips both calls entirely on the backend
+  // (see main.py's `judges` param), not just their result. Only meaningful
+  // before a run starts -- the toggle disables once one is active, same as
+  // the genre knob, since it can't retroactively affect tagging that
+  // already happened.
+  const [judgesEnabled, setJudgesEnabled] = useState(true);
+
   const [algorithms, setAlgorithms] = useState<AlgorithmInfo[]>([]);
   const algorithmLabels = useMemo(
     () => Object.fromEntries(algorithms.map((a) => [a.id, a.label])),
     [algorithms],
   );
+
+  // Filenames offered by the "select an image" grid, and which one (if any)
+  // is currently picked -- `null` when the active image instead came from
+  // the "upload your own" file input. Both write into the same `file` state
+  // below, so picking one always clears the other.
+  const [sampleImages, setSampleImages] = useState<string[]>([]);
+  const [selectedSample, setSelectedSample] = useState<string | null>(null);
+  const [sampleGridExpanded, setSampleGridExpanded] = useState(false);
 
   // The run in progress (or just completed): each algorithm's independent
   // tagging/generation state, keyed by algorithm id. Empty means no run is
@@ -723,6 +958,16 @@ export default function Home() {
   const busy =
     runActive &&
     Object.values(results).some((r) => r.status === "loading" || r.generating);
+
+  // Suite-mode-only: algorithms that finished tagging but haven't had a song
+  // generated (or started generating) yet -- what "Generate all" below would
+  // actually kick off if clicked right now. Recomputed on every render
+  // rather than tracked separately, so it stays correct as rows finish
+  // tagging or generating one at a time.
+  const pendingGenerateAlgorithms = runAlgorithms.filter((id) => {
+    const result = results[id];
+    return result?.status === "ready" && result.analysis && !result.generated && !result.generating;
+  });
 
   // Deleting is irreversible and nothing is backed up, so the button has to be
   // clicked twice. This holds whether it is currently armed.
@@ -746,6 +991,11 @@ export default function Home() {
       .then((response) => response.json())
       .then(setAlgorithms)
       .catch(offline("Could not load the algorithm list."));
+
+    fetch(`${API_URL}/test-images`)
+      .then((response) => response.json())
+      .then(setSampleImages)
+      .catch(offline("Could not load the sample image list."));
   }, []);
 
   // A button that stays armed is its own trap, so it disarms itself shortly
@@ -756,18 +1006,37 @@ export default function Home() {
     return () => clearTimeout(timer);
   }, [armed]);
 
-  // A live preview of whatever image is picked. Memoized rather than stored
-  // in state so creating it can't itself trigger a render; the effect below
-  // only handles the revoke.
-  const previewUrl = useMemo(
-    () => (file ? URL.createObjectURL(file) : null),
-    [file],
-  );
+  // Whether an image is picked at all -- either an uploaded `file` or a
+  // `selectedSample` filename, mutually exclusive with each other. Gates
+  // every run/clear button below, same as a plain `!file` check used to.
+  const hasImage = Boolean(file || selectedSample);
+
+  // A live preview of whatever image is picked. An uploaded file gets an
+  // object URL (memoized rather than stored in state so creating it can't
+  // itself trigger a render; the effect below only handles the revoke). A
+  // sample image just points straight at the backend's static route --
+  // plain <img> loads don't need CORS, unlike a `fetch()` of the same URL
+  // would, so there's no bytes to fetch or object URL to manage here.
+  const previewUrl = useMemo(() => {
+    if (file) return URL.createObjectURL(file);
+    if (selectedSample) return `${API_URL}/test-image-files/${selectedSample}`;
+    return null;
+  }, [file, selectedSample]);
   useEffect(() => {
     return () => {
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      if (previewUrl?.startsWith("blob:")) URL.revokeObjectURL(previewUrl);
     };
   }, [previewUrl]);
+
+  // Just records which sample was picked -- no bytes fetched client-side.
+  // /tag re-reads them from disk server-side (see main.py's `sample_image`
+  // param), so this never needs the browser to GET the image cross-origin.
+  function selectSampleImage(name: string) {
+    if (runActive || busy) return;
+    setFile(null);
+    setSelectedSample(name);
+    setError(null);
+  }
 
   async function handleClear() {
     if (!armed) {
@@ -785,6 +1054,7 @@ export default function Home() {
         "Could not clear the run.",
       );
       setFile(null);
+      setSelectedSample(null);
       setResults({});
       setQuery("");
       setNotice(
@@ -803,13 +1073,22 @@ export default function Home() {
     }
   }
 
-  async function tagOneAlgorithm(algorithm: string) {
-    if (!file) return;
+  // Returns rather than writes to `results` directly -- startRun below
+  // waits for every algorithm's call to settle before committing any of
+  // them, so the cards reveal together instead of one at a time.
+  async function tagOneAlgorithm(algorithm: string): Promise<[string, RunResult]> {
+    if (!hasImage) return [algorithm, { status: "error", error: "No image selected." }];
 
-    const body = new FormData();
-    body.append("image", file);
-    const params = new URLSearchParams({ algorithm });
+    const params = new URLSearchParams({ algorithm, judges: String(judgesEnabled) });
     if (genre) params.set("genre", genre);
+
+    let body: FormData | undefined;
+    if (file) {
+      body = new FormData();
+      body.append("image", file);
+    } else if (selectedSample) {
+      params.set("sample_image", selectedSample);
+    }
 
     try {
       const data: Analysis = await apiRequest(
@@ -817,18 +1096,12 @@ export default function Home() {
         { method: "POST", body },
         `Could not analyze the image with ${algorithm}.`,
       );
-      setResults((previous) => ({
-        ...previous,
-        [algorithm]: { status: "ready", analysis: data },
-      }));
+      return [algorithm, { status: "ready", analysis: data }];
     } catch (err) {
-      setResults((previous) => ({
-        ...previous,
-        [algorithm]: {
-          status: "error",
-          error: err instanceof Error ? err.message : String(err),
-        },
-      }));
+      return [
+        algorithm,
+        { status: "error", error: err instanceof Error ? err.message : String(err) },
+      ];
     }
   }
 
@@ -836,7 +1109,7 @@ export default function Home() {
   // /generate ever sets a Content-Type header: the browser has to set that
   // itself so it can include the multipart boundary marker.
   function startRun(algorithmIds: string[]) {
-    if (!file || runActive) return;
+    if (!hasImage || runActive) return;
 
     setError(null);
     setNotice(null);
@@ -844,17 +1117,23 @@ export default function Home() {
       Object.fromEntries(algorithmIds.map((id) => [id, { status: "loading" as const }])),
     );
 
-    // Independent parallel calls, one per algorithm -- each updates its own
-    // slot in `results` as it finishes, so one algorithm's failure or delay
-    // never blocks or blanks the others.
-    algorithmIds.forEach((id) => {
-      tagOneAlgorithm(id);
+    // Parallel calls, one per algorithm, but all committed to `results`
+    // together once every one has settled -- otherwise faster algorithms'
+    // cards would pop from "loading" to ready individually while slower
+    // ones are still spinning, which reads as flaky rather than "still
+    // working." A bit slower overall (bounded by the slowest algorithm) in
+    // exchange for every card updating at once. Still one independent
+    // request per algorithm, so one failure doesn't block or blank the
+    // others -- tagOneAlgorithm catches its own errors into a per-algorithm
+    // result rather than rejecting, so Promise.all here always resolves.
+    Promise.all(algorithmIds.map((id) => tagOneAlgorithm(id))).then((entries) => {
+      setResults((previous) => ({ ...previous, ...Object.fromEntries(entries) }));
     });
   }
 
   async function handleGenerate(algorithm: string) {
     const result = results[algorithm];
-    if (!file || !result?.analysis) return;
+    if (!hasImage || !result?.analysis) return;
 
     setResults((previous) => ({
       ...previous,
@@ -863,12 +1142,17 @@ export default function Home() {
 
     // Unlike /tag, /generate never re-tags the image -- it only needs the
     // original filename (for the audio naming convention), not the bytes,
-    // so there's no reason to re-upload the whole file here.
+    // so there's no reason to re-upload the whole file here. `tagging` still
+    // carries `image_data_url` (added for the downloadable report), which
+    // /generate would otherwise just echo back unread -- stripped here so a
+    // multi-MB base64 image doesn't ride along on every generate call.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- destructured only to exclude it from the rest
+    const { image_data_url, ...taggingForGenerate } = result.analysis.tagging;
     const body = new FormData();
-    body.append("image_filename", file.name);
+    body.append("image_filename", file ? file.name : (selectedSample ?? ""));
     body.append("tags", JSON.stringify(result.analysis.tags));
     body.append("tag_scores", JSON.stringify(result.analysis.tag_scores));
-    body.append("tagging", JSON.stringify(result.analysis.tagging));
+    body.append("tagging", JSON.stringify(taggingForGenerate));
     body.append("prompt", result.analysis.prompt);
 
     const params = new URLSearchParams({ algorithm: result.analysis.algorithm });
@@ -894,6 +1178,30 @@ export default function Home() {
         },
       }));
     }
+  }
+
+  // Suite mode only: fires handleGenerate for every algorithm that's ready
+  // and hasn't been generated (or isn't already generating) yet -- same
+  // independent-parallel-calls pattern as startRun, so one algorithm's
+  // apiframe error doesn't hold up the rest. Costs real apiframe credits
+  // (11 per song, so 5 algorithms is 55) -- there's no confirmation step
+  // here, matching the per-row "Generate song" button, which also commits
+  // credits on a single click.
+  function handleGenerateAll() {
+    pendingGenerateAlgorithms.forEach((algorithm) => {
+      handleGenerate(algorithm);
+    });
+  }
+
+  // Suite-mode-only, same gating spirit as "Generate all": available once
+  // every algorithm has finished tagging (loading or not is what's checked,
+  // not `busy`, since an in-progress song render shouldn't block a report
+  // about the tags).
+  const stillTagging = runAlgorithms.some((id) => results[id]?.status === "loading");
+
+  function handleDownloadReport() {
+    const html = buildReportHtml({ results, runAlgorithms, algorithmLabels, genre });
+    downloadReportHtml(html);
   }
 
   return (
@@ -959,34 +1267,7 @@ export default function Home() {
       </header>
 
       <div className="info-card">
-        <h2 className="section-title">How the tagging works</h2>
-        <ol className="info-steps">
-          <li>
-            The picked algorithm embeds the image and scores it against a
-            fixed vocabulary of adjectives grouped into 8 facets: color,
-            light, mood, valence, arousal, texture, energy, style.
-          </li>
-          <li>
-            A per-facet quota (2 color, 1 light, 3 mood, 1 valence, 1
-            arousal, 2 texture, 1 energy, 1 style) picks the top-scoring
-            words from each facet, so the 10 tags stay diverse instead of
-            collapsing onto one idea and its synonyms.
-          </li>
-          <li>
-            Claude reviews the tags against the image and flags any that read
-            as flatly wrong for its mood; each flagged tag is dropped, not
-            replaced. A second pass then checks for tags that contradict each
-            other&rsquo;s mood across facets and drops one of any such pair.
-          </li>
-          <li>
-            The final tags, plus an optional genre, become the prompt sent
-            to Suno to render the song.
-          </li>
-        </ol>
-      </div>
-
-      <div className="upload-card">
-        <h2 className="section-title">Select an image:</h2>
+        <h2 className="section-title">Select an image</h2>
 
         {apiDown && (
           <div className="status-error">
@@ -995,10 +1276,52 @@ export default function Home() {
           </div>
         )}
 
+        <div className="sample-grid">
+          {(sampleGridExpanded ? sampleImages : sampleImages.slice(0, 6)).map(
+            (name) => (
+              <button
+                key={name}
+                type="button"
+                onClick={() => selectSampleImage(name)}
+                disabled={runActive || busy}
+                className={
+                  "sample-thumb" +
+                  (selectedSample === name ? " sample-thumb-selected" : "")
+                }
+                aria-label={`Select sample image: ${name.replace(/\.png$/, "")}`}
+                aria-pressed={selectedSample === name}
+              >
+                <img src={`${API_URL}/test-image-files/${name}`} alt="" />
+              </button>
+            ),
+          )}
+        </div>
+
+        {sampleImages.length > 6 && (
+          <div className="sample-grid-toggle-row">
+            <button
+              type="button"
+              onClick={() => setSampleGridExpanded((expanded) => !expanded)}
+              className="sample-grid-toggle"
+              aria-label={sampleGridExpanded ? "Show fewer sample images" : "Show all sample images"}
+              aria-expanded={sampleGridExpanded}
+            >
+              {sampleGridExpanded ? "▲" : "▼"}
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="upload-card">
+        <h2 className="section-title">Upload your own</h2>
+
         <input
           type="file"
           accept="image/*"
-          onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+          onChange={(event) => {
+            setFile(event.target.files?.[0] ?? null);
+            setSelectedSample(null);
+          }}
           disabled={runActive || busy}
           className="file-picker"
         />
@@ -1006,18 +1329,28 @@ export default function Home() {
         <div className="run-buttons">
           <button
             onClick={() => startRun(["siglip"])}
-            disabled={!file || runActive || busy}
+            disabled={!hasImage || runActive || busy}
             className="btn-primary btn-lg"
           >
             Use SigLIP
           </button>
           <button
             onClick={() => startRun(algorithms.map((a) => a.id))}
-            disabled={!file || runActive || busy || algorithms.length === 0}
+            disabled={!hasImage || runActive || busy || algorithms.length === 0}
             className="btn-primary btn-lg"
           >
             5 Algorithm Suite
           </button>
+
+          <label className="judges-toggle">
+            <input
+              type="checkbox"
+              checked={judgesEnabled}
+              disabled={runActive || busy}
+              onChange={(event) => setJudgesEnabled(event.target.checked)}
+            />
+            LLM judges
+          </label>
         </div>
 
 
@@ -1027,6 +1360,29 @@ export default function Home() {
 
       {runActive && (
         <div className="runs">
+          {runAlgorithms.length > 1 && (
+            <div className="actions">
+              <button
+                type="button"
+                onClick={handleGenerateAll}
+                disabled={pendingGenerateAlgorithms.length === 0}
+                className="btn-primary"
+              >
+                {pendingGenerateAlgorithms.length > 0
+                  ? `Generate all ${pendingGenerateAlgorithms.length} in parallel (${pendingGenerateAlgorithms.length * 11} credits)`
+                  : "Generate all in parallel"}
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadReport}
+                disabled={stillTagging}
+                className="btn-sm"
+              >
+                Download tag analysis (.html)
+              </button>
+            </div>
+          )}
+
           {runAlgorithms.map((algorithm) => (
             <RunRow
               key={algorithm}
@@ -1044,7 +1400,7 @@ export default function Home() {
       <div className="danger-zone">
         <button
           onClick={handleClear}
-          disabled={!file || busy}
+          disabled={!hasImage || busy}
           className={`btn-lg btn-danger${armed ? " is-armed" : ""}`}
         >
           {armed ? "Clear this run? Click again" : "Clear"}

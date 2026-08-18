@@ -101,15 +101,56 @@ a:hover {
   background: var(--paper-dim);
 }
 
-.info-steps {
-  margin: 0.6rem 0 0;
-  padding-left: 1.1rem;
+.sample-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.sample-thumb {
+  aspect-ratio: 1 / 1;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: calc(var(--radius) * 0.6);
+  overflow: hidden;
+  cursor: pointer;
+  background: var(--paper-dim);
+}
+
+.sample-thumb:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.sample-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.sample-thumb-selected {
+  border-color: var(--accent);
+  outline: 2px solid var(--paper);
+  outline-offset: -4px;
+}
+
+.sample-grid-toggle-row {
   display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
-  font-size: 0.78rem;
-  line-height: 1.55;
+  justify-content: flex-end;
+  margin-top: 0.5rem;
+}
+
+.sample-grid-toggle {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
   color: var(--ink-soft);
+  font-size: 0.7rem;
+  line-height: 1;
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
 }
 
 .upload-card {
@@ -131,6 +172,25 @@ a:hover {
   flex: 1;
   min-width: 12rem;
   margin-top: 0;
+}
+
+.judges-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.judges-toggle input {
+  cursor: pointer;
+}
+
+.judges-toggle:has(input:disabled) {
+  cursor: default;
+  opacity: 0.6;
 }
 
 
