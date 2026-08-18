@@ -25,9 +25,14 @@ type JudgeVerdict = {
   reason: string;
 };
 
-type Replacement = {
-  from: string;
-  to: string;
+// A cross-facet mood contradiction the second judge found (e.g. "joyful" from
+// valence next to "haunting" from mood) -- `drop` names which of the pair got
+// dropped from the tag list entirely (no replacement is picked).
+type Contradiction = {
+  tag_a: string;
+  tag_b: string;
+  drop: string;
+  reason: string;
 };
 
 // What GET /algorithms returns: the embedding algorithms the picker offers, each
@@ -57,16 +62,16 @@ type Embedding = {
   points: EmbeddingPoint[];
 };
 
-// How the final 10 tags were arrived at: SigLIP's full top-20 candidates, the
-// pre-judge selection, the judge's per-tag verdicts, which flagged tags got
-// swapped for what, and the final tags -- each labeled with its facet.
-// Absent on runs saved before this was tracked.
+// How the final tags were arrived at: the full top-20 candidates, the first
+// judge's per-tag verdicts, the second judge's cross-facet contradiction
+// pairs, and the final tags -- each labeled with its facet. A tag either
+// judge flags is dropped outright, not replaced, so `final` can be shorter
+// than `top20`'s selected subset.
 type Tagging = {
   top20: FacetTag[];
-  selected: FacetTag[];
   judge: JudgeVerdict[];
+  contradictions: Contradiction[];
   final: FacetTag[];
-  replacements: Replacement[];
   embedding?: Embedding;
   // CoCa-only: a free-text caption from its captioning head. Display-only --
   // never fed into tag selection or the Suno prompt.
@@ -99,24 +104,6 @@ const FACET_COLORS: Record<string, string> = {
   style: "#e66767",
 };
 
-// Suno renders two takes of the same prompt per generation, and both are kept.
-type Generation = {
-  timestamp: string;
-  image: string;
-  genre: string;
-  // Absent on runs saved before algorithm choice was tracked -- those all ran
-  // through SigLIP, the only option that existed at the time.
-  algorithm?: string;
-  tags: string[];
-  // The picked algorithm's own confidence/similarity score per tag, keyed by
-  // the tag itself -- see TagBreakdown's score-meaning note for how to read it.
-  tag_scores: Record<string, number>;
-  tagging?: Tagging;
-  prompt: string;
-  job_id: string;
-  tracks: Track[];
-};
-
 // What `POST /tag` returns: the tagging half of the pipeline only, no Suno
 // call yet. Held in state until the user commits with "Generate song", at
 // which point it's sent straight back to `POST /generate` so the judge
@@ -129,13 +116,34 @@ type Analysis = {
   algorithm: string;
 };
 
-// Saved images and MP3s are served by the backend out of its history folder.
-// Audio filenames contain spaces, `&` and apostrophes, so each path segment is
-// escaped separately -- encoding the whole path would eat the `/` too.
+// What `POST /generate` returns: Suno renders two takes per job and both are
+// kept -- they cost nothing extra, and one is usually the better listen.
+type GeneratedSong = {
+  job_id: string;
+  tracks: Track[];
+};
+
+// One algorithm's slot within the current run. SigLIP mode has exactly one
+// of these; Suite mode has one per algorithm, tracked independently so a
+// single algorithm failing (a model that errors, a judge call that times
+// out) doesn't blank the other rows.
+type RunResult = {
+  status: "loading" | "ready" | "error";
+  analysis?: Analysis;
+  error?: string;
+  generating?: boolean;
+  generated?: GeneratedSong;
+  generateError?: string;
+};
+
+// Downloaded MP3s are served by the backend out of its (non-history) audio
+// folder. Filenames contain spaces, `&` and apostrophes, so each path
+// segment is escaped separately -- encoding the whole path would eat the
+// `/` too.
 const fileUrl = (path: string) =>
   `${API_URL}/files/${path.split("/").map(encodeURIComponent).join("/")}`;
 
-// Shared by every mutating call (wipe history, extract tags, generate song):
+// Shared by every mutating call (wipe run, extract tags, generate song):
 // fetch, parse JSON, and normalize both an API error (the response body's
 // `detail`) and a network failure into one `Error` with a message fit to
 // show the user -- so each call site's catch block is just `setError`.
@@ -158,15 +166,35 @@ async function apiRequest(
   }
 }
 
-// SigLIP's scores sit in a narrow band near zero, so a flat 3 decimals reads
-// as "0.000" for most of them -- indistinguishable from an actual zero. Shows
-// at least 3 decimals, extended just far enough to surface the first
-// non-zero digit for smaller scores.
+// The frontend (localhost:3000) and backend (127.0.0.1:8000) are different
+// origins, so a plain `<a download href={fileUrl(...)}>` won't reliably
+// force a save -- browsers ignore the `download` attribute cross-origin and
+// just navigate instead. Fetching the audio as a blob first and saving
+// *that* via a temporary object URL works regardless of origin, since the
+// blob URL belongs to this page once created.
+async function downloadTrack(track: Track) {
+  const response = await fetch(fileUrl(track.audioFile));
+  if (!response.ok) throw new Error("Could not download the track.");
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = track.audioFile.split("/").pop() ?? "track.mp3";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+// Scores sit in a narrow band near zero (SigLIP's probabilities, and the other
+// algorithms' raw cosine similarities alike), so a flat 3 decimals reads as
+// "0.000" for the smallest ones -- indistinguishable from an actual zero. Below
+// 0.001 this switches to scientific notation instead of adding more decimals, so
+// a real value is always visible no matter how small.
 function formatScore(score: number): string {
   if (!Number.isFinite(score) || score === 0) return "0.000";
-  const magnitude = Math.floor(Math.log10(Math.abs(score)));
-  const decimals = Math.min(Math.max(-magnitude, 3), 6);
-  return score.toFixed(decimals);
+  if (Math.abs(score) < 0.001) return score.toExponential(2);
+  return score.toFixed(3);
 }
 
 const PLOT_WIDTH = 520;
@@ -381,61 +409,100 @@ function EmbeddingPlot({
   );
 }
 
+// One tag pill -- used both for the final tag row (bright) and the top-20
+// candidates row (muted, with the selected ones highlighted), which used to
+// hand-build the same tag-group/tag-facet/tag/tag-score markup separately.
+function TagChip({
+  tag,
+  facet,
+  score,
+  muted,
+  selected,
+}: {
+  tag: string;
+  facet: string;
+  score: number;
+  muted?: boolean;
+  selected?: boolean;
+}) {
+  return (
+    <span className={`tag-group${selected ? " is-selected" : ""}`}>
+      <span className="tag-facet">{facet}</span>
+      <span className={`tag${muted ? " tag-muted" : ""}`}>
+        {tag}
+        <span className="tag-score">{formatScore(score)}</span>
+      </span>
+    </span>
+  );
+}
+
+// One judge's findings -- the mood-fit judge and the contradiction judge
+// used to each hand-write the same heading/list/empty-state JSX shape with
+// only their row data differing; this is that shape, parameterized once.
+function JudgeReviewSection({
+  title,
+  emptyMessage,
+  rows,
+}: {
+  title: string;
+  emptyMessage: string;
+  rows: { key: string; flaggedTag: string; reason: string }[];
+}) {
+  return (
+    <div className="judge-review">
+      <span className="meta-label">{title}</span>
+      {rows.length > 0 ? (
+        <ul className="judge-list">
+          {rows.map((row) => (
+            <li key={row.key} className="judge-item">
+              <span className="judge-flagged">{row.flaggedTag}</span>
+              <span className="judge-dropped">dropped</span>
+              {row.reason && <div className="judge-reason">{row.reason}</div>}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="judge-empty">{emptyMessage}</p>
+      )}
+    </div>
+  );
+}
+
 // The tag row, judge review, top-20 candidates and prompt line -- shared by
-// the pending analysis card (before a song exists) and each history run card
-// (after one does), so the two views never drift apart.
+// every algorithm row in the current run, so SigLIP mode and Suite mode
+// never drift apart in how they present a tag set. Its one call site
+// (RunRow) only renders this once tagging has actually succeeded, so every
+// prop here is guaranteed to exist by then -- no defaulting needed.
 function TagBreakdown({
-  tags,
-  tagScores,
   tagging,
   prompt,
   algorithm,
   algorithmLabel,
 }: {
-  tags: string[];
-  tagScores: Record<string, number>;
-  tagging?: Tagging;
+  tagging: Tagging;
   prompt: string;
-  // Absent on runs saved before algorithm choice was tracked, all of which ran
-  // through SigLIP -- both default to it so old history cards still read right.
-  algorithm?: string;
-  algorithmLabel?: string;
+  algorithm: string;
+  algorithmLabel: string;
 }) {
-  // Runs saved before tagging detail was tracked fall back to the plain
-  // tag+score list, with no facet label.
-  const finalTags: { tag: string; facet?: string; score?: number }[] =
-    tagging?.final ?? tags.map((tag) => ({ tag, score: tagScores?.[tag] }));
-
   // Only SigLIP has a trained calibration head turning cosine similarity into a
   // 0-1 probability (see backend/embedding_tagger.py's module docstring) -- every
   // other algorithm here scores with raw cosine similarity on its own scale, so
   // the score-meaning copy has to say something different for it.
-  const calibrated = (algorithm ?? "siglip") === "siglip";
-  const label = algorithmLabel ?? "SigLIP";
+  const calibrated = algorithm === "siglip";
 
   return (
     <>
-      {finalTags.length > 0 && (
+      {tagging.final.length > 0 && (
         <>
-          {/* One tag set drove both takes, so it sits above them rather than
-              being repeated. Strongest match first. */}
           <div className="tags">
-            {finalTags.map(({ tag, facet, score }) => (
-              <span key={tag} className="tag-group">
-                {facet && <span className="tag-facet">{facet}</span>}
-                <span className="tag">
-                  {tag}
-                  {score !== undefined && (
-                    <span className="tag-score">{formatScore(score)}</span>
-                  )}
-                </span>
-              </span>
+            {tagging.final.map(({ tag, facet, score }) => (
+              <TagChip key={tag} tag={tag} facet={facet} score={score} />
             ))}
           </div>
           <p className="note">
             {calibrated ? (
               <>
-                The number beside each tag is {label}&rsquo;s match
+                The number beside each tag is {algorithmLabel}&rsquo;s match
                 probability for that word against this image (0–1) -- not a
                 rank. Scores across the whole vocabulary sit close to zero, so
                 small differences still mean one word fit noticeably better
@@ -444,94 +511,64 @@ function TagBreakdown({
             ) : (
               <>
                 The number beside each tag is raw cosine similarity between
-                the image and that word in {label}&rsquo;s own embedding
-                space -- not a rank, and not on the same 0–1 scale as SigLIP&rsquo;s
-                calibrated probability, so it isn&rsquo;t meaningful to
-                compare these numbers across algorithms.
+                the image and that word in {algorithmLabel}&rsquo;s own
+                embedding space -- not a rank, and not on the same 0–1 scale
+                as SigLIP&rsquo;s calibrated probability, so it isn&rsquo;t
+                meaningful to compare these numbers across algorithms.
               </>
             )}
           </p>
         </>
       )}
 
-      {tagging?.caption && (
+      {tagging.caption && (
         <div className="caption-block">
           <span className="meta-label">caption</span>
           <p className="caption-text">&ldquo;{tagging.caption}&rdquo;</p>
           <p className="note">
-            {label}&rsquo;s captioning head describing the image in free text
-            -- shown for comparison only, never sent to Suno or used to pick
-            tags.
+            {algorithmLabel}&rsquo;s captioning head describing the image in
+            free text -- shown for comparison only, never sent to Suno or
+            used to pick tags.
           </p>
         </div>
       )}
 
-      {tagging &&
-        (tagging.replacements.length > 0 ||
-          tagging.judge.some((v) => v.flagged)) && (
-          <div className="judge-review">
-            <span className="meta-label">judge review</span>
-            <ul className="judge-list">
-              {tagging.judge
-                .filter((v) => v.flagged)
-                .map((verdict) => {
-                  const replacement = tagging.replacements.find(
-                    (r) => r.from === verdict.tag,
-                  );
-                  return (
-                    <li key={verdict.tag} className="judge-item">
-                      <span className="judge-flagged">{verdict.tag}</span>
-                      {replacement && (
-                        <>
-                          <span className="judge-arrow" aria-hidden="true">
-                            →
-                          </span>
-                          <span className="judge-replacement">
-                            {replacement.to}
-                          </span>
-                        </>
-                      )}
-                      {verdict.reason && (
-                        <div className="judge-reason">{verdict.reason}</div>
-                      )}
-                    </li>
-                  );
-                })}
-            </ul>
-          </div>
-        )}
+      <JudgeReviewSection
+        title="judge review 1 -- mood fit"
+        emptyMessage="Judge #1 found no tags that didn't fit the image's mood this run."
+        rows={tagging.judge
+          .filter((v) => v.flagged)
+          .map((v) => ({ key: v.tag, flaggedTag: v.tag, reason: v.reason }))}
+      />
 
-      {tagging && tagging.top20.length > 0 && (
+      <JudgeReviewSection
+        title="judge review 2 -- contradictions"
+        emptyMessage="Judge #2 identified no contradictory tags this run."
+        rows={tagging.contradictions.map((c, index) => {
+          const kept = c.drop === c.tag_a ? c.tag_b : c.tag_a;
+          return {
+            key: `${c.tag_a}-${c.tag_b}-${index}`,
+            flaggedTag: c.drop,
+            reason: `contradicted “${kept}” -- ${c.reason}`,
+          };
+        })}
+      />
+
+      {tagging.top20.length > 0 && (
         <div className="top20">
           <span className="meta-label">top 20 candidates</span>
           <div className="tags tags-muted">
-            {tagging.top20.map(({ tag, facet, score }) => {
-              const isFinal = tagging.final.some((f) => f.tag === tag);
-              return (
-                <span
-                  key={tag}
-                  className={`tag-group${isFinal ? " is-selected" : ""}`}
-                >
-                  <span className="tag-facet">{facet}</span>
-                  <span className="tag tag-muted">
-                    {tag}
-                    <span className="tag-score">{formatScore(score)}</span>
-                  </span>
-                </span>
-              );
-            })}
+            {tagging.top20.map(({ tag, facet, score }) => (
+              <TagChip
+                key={tag}
+                tag={tag}
+                facet={facet}
+                score={score}
+                muted
+                selected={tagging.final.some((f) => f.tag === tag)}
+              />
+            ))}
           </div>
-        </div>
-      )}
-
-      {tagging?.embedding && tagging.embedding.points.length > 0 && (
-        <div className="embedding-section">
-          <span className="meta-label">embedding space (illustrative)</span>
-          <EmbeddingPlot
-            embedding={tagging.embedding}
-            finalTags={new Set(tagging.final.map((f) => f.tag))}
-            algorithmLabel={label}
-          />
         </div>
       )}
 
@@ -545,72 +582,160 @@ function TagBreakdown({
   );
 }
 
+// One row of the run: the image on the left, that algorithm's tag breakdown
+// on the right, and (once tagging succeeded) its own independent Generate
+// song action and result. Used for both SigLIP mode (one row) and Suite
+// mode (five rows, back to back, so tag sets are easy to compare).
+function RunRow({
+  algorithmLabel,
+  previewUrl,
+  result,
+  onGenerate,
+}: {
+  algorithmLabel: string;
+  previewUrl: string | null;
+  result: RunResult;
+  onGenerate: () => void;
+}) {
+  const embedding = result.analysis?.tagging.embedding;
+
+  return (
+    <div className="run-row">
+      <div className="run-row-media">
+        {previewUrl && (
+          // eslint-disable-next-line @next/next/no-img-element -- local blob: URL, not a remote image
+          <img src={previewUrl} alt="" className="run-row-image" />
+        )}
+
+        {/* Fills the space below the image rather than leaving it blank --
+            same data the old inline embedding section showed, just relocated
+            so the image column isn't dead space once tagging finishes. */}
+        {embedding && embedding.points.length > 0 && result.analysis && (
+          <div className="embedding-section">
+            <span className="meta-label">embedding space (illustrative)</span>
+            <EmbeddingPlot
+              embedding={embedding}
+              finalTags={new Set(result.analysis.tagging.final.map((f) => f.tag))}
+              algorithmLabel={algorithmLabel}
+            />
+          </div>
+        )}
+      </div>
+
+      <div className="run-row-body">
+        <div className="run-row-head">
+          <span className="run-name">{algorithmLabel}: Tag Analysis</span>
+        </div>
+
+        {result.status === "loading" && (
+          <p className="status-notice">Tagging with {algorithmLabel}…</p>
+        )}
+
+        {result.status === "error" && (
+          <p className="status-error">{result.error}</p>
+        )}
+
+        {result.status === "ready" && result.analysis && (
+          <>
+            <TagBreakdown
+              tagging={result.analysis.tagging}
+              prompt={result.analysis.prompt}
+              algorithm={result.analysis.algorithm}
+              algorithmLabel={algorithmLabel}
+            />
+
+            {!result.generated && (
+              <div className="actions">
+                <button
+                  onClick={onGenerate}
+                  disabled={result.generating}
+                  className="btn-primary"
+                >
+                  {result.generating ? "Composing…" : "Generate song"}
+                </button>
+              </div>
+            )}
+
+            {result.generating && (
+              <p className="status-notice">
+                This takes about two minutes. Keep this tab open.
+              </p>
+            )}
+
+            {result.generateError && (
+              <p className="status-error">{result.generateError}</p>
+            )}
+
+            {result.generated?.tracks.map((track, index) => (
+              <div key={track.audioFile} className="take">
+                <div className="take-title">
+                  Take {index + 1}
+                  <span className="take-name">
+                    {" — "}
+                    {track.title}
+                  </span>
+                </div>
+                <audio controls src={fileUrl(track.audioFile)} />
+                <div className="actions">
+                  <button
+                    type="button"
+                    onClick={() => downloadTrack(track)}
+                    className="btn-sm"
+                  >
+                    ⬇ Download
+                  </button>
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
-  const [history, setHistory] = useState<Generation[]>([]);
-  // Two separate in-flight flags: analyzing is the free, fast /tag call;
-  // loading is the Suno render, which costs credits and takes ~2 minutes.
-  const [analyzing, setAnalyzing] = useState(false);
-  const [analysis, setAnalysis] = useState<Analysis | null>(null);
-  const [loading, setLoading] = useState(false);
-  const busy = analyzing || loading;
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [genres, setGenres] = useState<string[]>([]);
   // The text in the search box, and the single source of truth for the genre.
   // A half-typed word simply isn't a genre yet, which is what `genre` derives.
   const [query, setQuery] = useState("");
   const genre = genres.includes(query) ? query : "";
 
-  // The rail's primary control: which embedding algorithm tags the image.
-  // Defaults to SigLIP, today's only algorithm before this and still the one
-  // with a calibrated score (see TagBreakdown's score-meaning note).
   const [algorithms, setAlgorithms] = useState<AlgorithmInfo[]>([]);
-  const [algorithm, setAlgorithm] = useState("siglip");
   const algorithmLabels = useMemo(
     () => Object.fromEntries(algorithms.map((a) => [a.id, a.label])),
     [algorithms],
   );
-  const algorithmLabel = algorithmLabels[algorithm] ?? algorithm;
+
+  // The run in progress (or just completed): each algorithm's independent
+  // tagging/generation state, keyed by algorithm id. Empty means no run is
+  // active, which is also what gates the file input -- one run at a time.
+  // `runAlgorithms` is just this object's keys (insertion order is
+  // preserved for the non-numeric string keys used here), kept as its own
+  // derived value rather than a second piece of state that could drift out
+  // of sync with `results`.
+  const [results, setResults] = useState<Record<string, RunResult>>({});
+  const runAlgorithms = Object.keys(results);
+  const runActive = runAlgorithms.length > 0;
+  const busy =
+    runActive &&
+    Object.values(results).some((r) => r.status === "loading" || r.generating);
+
   // Deleting is irreversible and nothing is backed up, so the button has to be
   // clicked twice. This holds whether it is currently armed.
   const [armed, setArmed] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
-  // Which run cards the user has opened or closed by hand. Runs not in here
-  // follow the default: the newest is open, the rest are collapsed.
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   // Set when the first loads can't reach the backend, so the page can say so
   // instead of looking like an app with every button broken.
   const [apiDown, setApiDown] = useState(false);
 
-  // Genre leads the prompt, so a stale analysis would send the wrong prompt
-  // to Suno if the genre changed after analyzing. Algorithm choice changes
-  // the tags themselves. Either one changing after analyzing makes the held
-  // analysis stale, so re-analyzing is cheap and it's just cleared rather
-  // than silently patched. Adjusted during render (same pattern as
-  // SpinKnob's own prop-follow) rather than in an effect, so it can't cause
-  // an extra paint.
-  const [seenGenre, setSeenGenre] = useState(genre);
-  const [seenAlgorithm, setSeenAlgorithm] = useState(algorithm);
-  if (genre !== seenGenre || algorithm !== seenAlgorithm) {
-    setSeenGenre(genre);
-    setSeenAlgorithm(algorithm);
-    setAnalysis(null);
-  }
-
-  // Load past runs and the genre list once, when the page first mounts. A
-  // failure here means the backend is unreachable, which is worth saying
-  // plainly: without it every control sits disabled with no genres and no
-  // history, which reads as a broken app rather than a stopped server.
   useEffect(() => {
     const offline = (message: string) => () => {
       setError(message);
       setApiDown(true);
     };
-
-    fetch(`${API_URL}/history`)
-      .then((response) => response.json())
-      .then(setHistory)
-      .catch(offline("Could not load past songs."));
 
     fetch(`${API_URL}/genres`)
       .then((response) => response.json())
@@ -631,9 +756,9 @@ export default function Home() {
     return () => clearTimeout(timer);
   }, [armed]);
 
-  // A live preview of whatever image is picked, for the pending analysis
-  // card. Memoized rather than stored in state so creating it can't itself
-  // trigger a render; the effect below only handles the revoke.
+  // A live preview of whatever image is picked. Memoized rather than stored
+  // in state so creating it can't itself trigger a render; the effect below
+  // only handles the revoke.
   const previewUrl = useMemo(
     () => (file ? URL.createObjectURL(file) : null),
     [file],
@@ -644,7 +769,7 @@ export default function Home() {
     };
   }, [previewUrl]);
 
-  async function handleWipe() {
+  async function handleClear() {
     if (!armed) {
       setArmed(true);
       return;
@@ -657,14 +782,17 @@ export default function Home() {
       const data = await apiRequest(
         `${API_URL}/history`,
         { method: "DELETE" },
-        "Could not clear the history.",
+        "Could not clear the run.",
       );
-      setHistory([]);
+      setFile(null);
+      setResults({});
+      setQuery("");
       setNotice(
-        `Deleted ${data.entries_removed} runs, ${data.files_removed} files, ` +
-          `${data.megabytes_freed} MB freed.`,
+        `Deleted ${data.files_removed} files, ${data.megabytes_freed} MB freed.`,
       );
     } catch (err) {
+      // A failed wipe leaves the run in place rather than silently resetting
+      // the UI while stale files remain on the backend.
       setError(err instanceof Error ? err.message : String(err));
     }
   }
@@ -675,189 +803,108 @@ export default function Home() {
     }
   }
 
-  // FormData is what makes these file uploads. Note neither ever sets a
-  // Content-Type header: the browser has to set that itself so it can
-  // include the multipart boundary marker.
-
-  async function handleAnalyze() {
+  async function tagOneAlgorithm(algorithm: string) {
     if (!file) return;
-
-    setAnalyzing(true);
-    setError(null);
-    setNotice(null);
-    setAnalysis(null);
 
     const body = new FormData();
     body.append("image", file);
-
     const params = new URLSearchParams({ algorithm });
     if (genre) params.set("genre", genre);
 
     try {
-      const data = await apiRequest(
+      const data: Analysis = await apiRequest(
         `${API_URL}/tag?${params}`,
         { method: "POST", body },
-        "Could not analyze the image.",
+        `Could not analyze the image with ${algorithm}.`,
       );
-      setAnalysis(data);
+      setResults((previous) => ({
+        ...previous,
+        [algorithm]: { status: "ready", analysis: data },
+      }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setAnalyzing(false);
+      setResults((previous) => ({
+        ...previous,
+        [algorithm]: {
+          status: "error",
+          error: err instanceof Error ? err.message : String(err),
+        },
+      }));
     }
   }
 
-  async function handleGenerateSong() {
-    if (!file || !analysis) return;
+  // FormData is what makes these file uploads. Note neither /tag nor
+  // /generate ever sets a Content-Type header: the browser has to set that
+  // itself so it can include the multipart boundary marker.
+  function startRun(algorithmIds: string[]) {
+    if (!file || runActive) return;
 
-    setLoading(true);
     setError(null);
     setNotice(null);
+    setResults(
+      Object.fromEntries(algorithmIds.map((id) => [id, { status: "loading" as const }])),
+    );
 
+    // Independent parallel calls, one per algorithm -- each updates its own
+    // slot in `results` as it finishes, so one algorithm's failure or delay
+    // never blocks or blanks the others.
+    algorithmIds.forEach((id) => {
+      tagOneAlgorithm(id);
+    });
+  }
+
+  async function handleGenerate(algorithm: string) {
+    const result = results[algorithm];
+    if (!file || !result?.analysis) return;
+
+    setResults((previous) => ({
+      ...previous,
+      [algorithm]: { ...previous[algorithm], generating: true, generateError: undefined },
+    }));
+
+    // Unlike /tag, /generate never re-tags the image -- it only needs the
+    // original filename (for the audio naming convention), not the bytes,
+    // so there's no reason to re-upload the whole file here.
     const body = new FormData();
-    body.append("image", file);
-    body.append("tags", JSON.stringify(analysis.tags));
-    body.append("tag_scores", JSON.stringify(analysis.tag_scores));
-    body.append("tagging", JSON.stringify(analysis.tagging));
-    body.append("prompt", analysis.prompt);
+    body.append("image_filename", file.name);
+    body.append("tags", JSON.stringify(result.analysis.tags));
+    body.append("tag_scores", JSON.stringify(result.analysis.tag_scores));
+    body.append("tagging", JSON.stringify(result.analysis.tagging));
+    body.append("prompt", result.analysis.prompt);
 
-    const params = new URLSearchParams({ algorithm: analysis.algorithm });
+    const params = new URLSearchParams({ algorithm: result.analysis.algorithm });
     if (genre) params.set("genre", genre);
 
     try {
-      const data = await apiRequest(
+      const data: GeneratedSong = await apiRequest(
         `${API_URL}/generate?${params}`,
         { method: "POST", body },
         "Could not generate a song.",
       );
-      setHistory((previous) => [data, ...previous]);
-      setAnalysis(null);
-      setFile(null);
+      setResults((previous) => ({
+        ...previous,
+        [algorithm]: { ...previous[algorithm], generating: false, generated: data },
+      }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
+      setResults((previous) => ({
+        ...previous,
+        [algorithm]: {
+          ...previous[algorithm],
+          generating: false,
+          generateError: err instanceof Error ? err.message : String(err),
+        },
+      }));
     }
   }
 
   return (
     <main className="page">
       <header className="hero">
-        <h1 className="title">Image to Song</h1>
-        <p className="subtitle">Turn a picture into a piece of music.</p>
-      </header>
-
-      <div className="rail-column">
-        <div className="rail">
-          {apiDown && (
-            <div className="status-error">
-              Can’t reach the backend at {API_URL}. Is `uvicorn main:app
-              --reload` running?
-            </div>
-          )}
-
-          <input
-            type="file"
-            accept="image/*"
-            onChange={(event) => {
-              // A pending analysis is tied to whatever image produced it --
-              // swapping the file without re-analyzing would otherwise let
-              // Generate song save the new image next to the old one's tags,
-              // judge review and prompt.
-              setFile(event.target.files?.[0] ?? null);
-              setAnalysis(null);
-            }}
-            disabled={busy}
-            className="file-picker"
-          />
-
-          <section className="algorithm">
-            <SpinKnob
-              options={algorithms.map((a) => a.id)}
-              value={algorithm}
-              onChange={setAlgorithm}
-              label="Embedding algorithm"
-              disabled={busy}
-            />
-
-            <div className="algorithm-fields">
-              <span className="genre-label">Algorithm</span>
-              <span className="algorithm-name">{algorithmLabel}</span>
-              <p className="hint">
-                {algorithms.find((a) => a.id === algorithm)?.blurb ?? ""}
-              </p>
-            </div>
-          </section>
-
-          <button
-            onClick={handleAnalyze}
-            disabled={!file || busy}
-            className="btn-primary btn-lg"
-          >
-            {analyzing ? "Extracting…" : "Extract tags"}
-          </button>
-          <p className="note">
-            Free and fast: scores the image against the tag vocabulary and
-            asks the judge to review it. Nothing is sent to Suno until you
-            generate.
-          </p>
-
-          {error && <p className="status-error">{error}</p>}
-          {notice && <p className="status-notice">{notice}</p>}
-
-          {history.length > 0 && (
-            <div className="danger-zone">
-              <button
-                onClick={handleWipe}
-                disabled={busy}
-                className={`btn-sm btn-danger${armed ? " is-armed" : ""}`}
-              >
-                {armed
-                  ? `Delete ${history.length} runs? Click again`
-                  : "Clear history"}
-              </button>
-              <p className="note">
-                Deletes every saved image and MP3. Nothing is backed up.
-              </p>
-            </div>
-          )}
-        </div>
-
-        <div className="info-card">
-          <h2 className="section-title">How the tagging works</h2>
-          <ol className="info-steps">
-            <li>
-              The picked algorithm ({algorithmLabel}) embeds the image and
-              scores it against a fixed vocabulary of adjectives grouped into
-              8 facets: color, light, mood, valence, arousal, texture,
-              energy, style.
-            </li>
-            <li>
-              A per-facet quota (2 color, 1 light, 3 mood, 1 valence, 1
-              arousal, 2 texture, 1 energy, 1 style) picks the top-scoring
-              words from each facet, so the 10 tags stay diverse instead of
-              collapsing onto one idea and its synonyms.
-            </li>
-            <li>
-              Claude reviews the 10 tags against the image and flags any that
-              read as flatly wrong for its mood; each flagged tag is swapped
-              for the next-best word in the same facet.
-            </li>
-            <li>
-              The final tags, plus an optional genre, become the prompt sent
-              to Suno to render the song.
-            </li>
-          </ol>
-        </div>
+        <h1 className="title">Atlantis</h1>
 
         <div className="genre-card">
           <h2 className="section-title">
             Genre <span className="meta-label">(optional, just for fun)</span>
           </h2>
-          <p className="note">
-            Adds a style hint to the Suno prompt -- it doesn&rsquo;t change
-            which algorithm scores the image or which tags it picks.
-          </p>
 
           <section className="genre">
             <SpinKnob
@@ -865,7 +912,7 @@ export default function Home() {
               value={genre}
               onChange={setQuery}
               label="Genre"
-              disabled={busy}
+              disabled={busy || runActive}
             />
 
             <div className="genre-fields">
@@ -877,7 +924,7 @@ export default function Home() {
                 id="genre-search"
                 list="genre-options"
                 value={query}
-                disabled={busy}
+                disabled={busy || runActive}
                 placeholder="spin, search or roll"
                 onChange={(event) => setQuery(event.target.value)}
                 className="genre-input"
@@ -892,7 +939,7 @@ export default function Home() {
                 <button
                   type="button"
                   onClick={rollRandomGenre}
-                  disabled={busy || genres.length === 0}
+                  disabled={busy || runActive || genres.length === 0}
                   className="btn-sm"
                 >
                   🎲 Random
@@ -900,171 +947,112 @@ export default function Home() {
                 <button
                   type="button"
                   onClick={() => setQuery("")}
-                  disabled={busy || !query}
+                  disabled={busy || runActive || !query}
                   className="btn-sm"
                 >
                   Clear
                 </button>
               </div>
-
-              <p className="hint">
-                {genre
-                  ? `Suno will be told to make ${genre}.`
-                  : "No genre: the song comes only from the picture."}
-              </p>
             </div>
           </section>
         </div>
+      </header>
+
+      <div className="info-card">
+        <h2 className="section-title">How the tagging works</h2>
+        <ol className="info-steps">
+          <li>
+            The picked algorithm embeds the image and scores it against a
+            fixed vocabulary of adjectives grouped into 8 facets: color,
+            light, mood, valence, arousal, texture, energy, style.
+          </li>
+          <li>
+            A per-facet quota (2 color, 1 light, 3 mood, 1 valence, 1
+            arousal, 2 texture, 1 energy, 1 style) picks the top-scoring
+            words from each facet, so the 10 tags stay diverse instead of
+            collapsing onto one idea and its synonyms.
+          </li>
+          <li>
+            Claude reviews the tags against the image and flags any that read
+            as flatly wrong for its mood; each flagged tag is dropped, not
+            replaced. A second pass then checks for tags that contradict each
+            other&rsquo;s mood across facets and drops one of any such pair.
+          </li>
+          <li>
+            The final tags, plus an optional genre, become the prompt sent
+            to Suno to render the song.
+          </li>
+        </ol>
       </div>
 
-      <div className="stream">
-        {analysis && (
-          <div className="run-card is-open pending-card">
-            <div className="run-head">
-              <span className="run-head-text">
-                <span className="run-name">
-                  Tag Analysis: {algorithmLabel} joint embedding
-                </span>
-                <span className="run-stamp">
-                  {algorithmLabel} · {genre || "no genre"} · not generated yet
-                </span>
-              </span>
-            </div>
+      <div className="upload-card">
+        <h2 className="section-title">Select an image:</h2>
 
-            <div className="run-body">
-              {previewUrl && (
-                // eslint-disable-next-line @next/next/no-img-element -- local blob: URL, not a remote image
-                <img src={previewUrl} alt="" className="run-image" />
-              )}
-
-              <TagBreakdown
-                tags={analysis.tags}
-                tagScores={analysis.tag_scores}
-                tagging={analysis.tagging}
-                prompt={analysis.prompt}
-                algorithm={analysis.algorithm}
-                algorithmLabel={algorithmLabels[analysis.algorithm] ?? analysis.algorithm}
-              />
-
-              <div className="actions">
-                <button
-                  onClick={handleGenerateSong}
-                  disabled={loading}
-                  className="btn-primary"
-                >
-                  {loading ? "Composing…" : "Generate song"}
-                </button>
-                <button
-                  onClick={() => setAnalysis(null)}
-                  disabled={loading}
-                  className="btn-sm"
-                >
-                  Discard
-                </button>
-              </div>
-
-              {loading && (
-                <p className="status-notice">
-                  This takes about two minutes. Keep this tab open.
-                </p>
-              )}
-            </div>
+        {apiDown && (
+          <div className="status-error">
+            Can’t reach the backend at {API_URL}. Is `uvicorn main:app
+            --reload` running?
           </div>
         )}
 
-        {history.length === 0 && !analysis && !apiDown && (
-          <p className="stream-empty">
-            Nothing here yet. Pick an image on the left and hit Extract tags.
-          </p>
-        )}
+        <input
+          type="file"
+          accept="image/*"
+          onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+          disabled={runActive || busy}
+          className="file-picker"
+        />
 
-        <ul className="runs">
-          {history.map((entry, entryIndex) => {
-            const runKey = entry.image;
-            const open = expanded[runKey] ?? entryIndex === 0;
+        <div className="run-buttons">
+          <button
+            onClick={() => startRun(["siglip"])}
+            disabled={!file || runActive || busy}
+            className="btn-primary btn-lg"
+          >
+            Use SigLIP
+          </button>
+          <button
+            onClick={() => startRun(algorithms.map((a) => a.id))}
+            disabled={!file || runActive || busy || algorithms.length === 0}
+            className="btn-primary btn-lg"
+          >
+            5 Algorithm Suite
+          </button>
+        </div>
 
-            return (
-              <li key={runKey} className={`run-card${open ? " is-open" : ""}`}>
-                <button
-                  type="button"
-                  className="run-head"
-                  aria-expanded={open}
-                  onClick={() =>
-                    setExpanded((previous) => ({ ...previous, [runKey]: !open }))
-                  }
-                >
-                  <span className="run-index" aria-hidden="true">
-                    {String(history.length - entryIndex).padStart(2, "0")}
-                  </span>
 
-                  {/* eslint-disable-next-line @next/next/no-img-element -- next/image would need remote-host config for a local dev-only backend */}
-                  <img
-                    src={fileUrl(entry.image)}
-                    alt=""
-                    width={46}
-                    height={46}
-                    className="run-thumb"
-                  />
+        {error && <p className="status-error">{error}</p>}
+        {notice && <p className="status-notice">{notice}</p>}
+      </div>
 
-                  <span className="run-head-text">
-                    <span className="run-name">
-                      {entry.tracks[0]?.title ?? "Untitled"}
-                    </span>
-                    <span className="run-stamp">
-                      {new Date(entry.timestamp).toLocaleString()}
-                      {" · "}
-                      {algorithmLabels[entry.algorithm ?? "siglip"] ??
-                        entry.algorithm ??
-                        "SigLIP"}
-                      {entry.genre && ` · ${entry.genre}`}
-                    </span>
-                  </span>
+      {runActive && (
+        <div className="runs">
+          {runAlgorithms.map((algorithm) => (
+            <RunRow
+              key={algorithm}
+              algorithmLabel={algorithmLabels[algorithm] ?? algorithm}
+              previewUrl={previewUrl}
+              result={
+                results[algorithm] ?? { status: "loading" as const }
+              }
+              onGenerate={() => handleGenerate(algorithm)}
+            />
+          ))}
+        </div>
+      )}
 
-                  <span className="run-caret" aria-hidden="true">
-                    {open ? "▼" : "►"}
-                  </span>
-                </button>
-
-                {open && (
-                  <div className="run-body">
-                    {/* eslint-disable-next-line @next/next/no-img-element -- same local-backend reasoning as run-thumb above */}
-                    <img
-                      src={fileUrl(entry.image)}
-                      alt=""
-                      className="run-image"
-                    />
-
-                    <TagBreakdown
-                      tags={entry.tags}
-                      tagScores={entry.tag_scores}
-                      tagging={entry.tagging}
-                      prompt={entry.prompt}
-                      algorithm={entry.algorithm ?? "siglip"}
-                      algorithmLabel={
-                        algorithmLabels[entry.algorithm ?? "siglip"] ??
-                        entry.algorithm ??
-                        "SigLIP"
-                      }
-                    />
-
-                    {entry.tracks.map((track, index) => (
-                      <div key={track.audioFile} className="take">
-                        <div className="take-title">
-                          Take {index + 1}
-                          <span className="take-name">
-                            {" — "}
-                            {track.title}
-                          </span>
-                        </div>
-                        <audio controls src={fileUrl(track.audioFile)} />
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </li>
-            );
-          })}
-        </ul>
+      <div className="danger-zone">
+        <button
+          onClick={handleClear}
+          disabled={!file || busy}
+          className={`btn-lg btn-danger${armed ? " is-armed" : ""}`}
+        >
+          {armed ? "Clear this run? Click again" : "Clear"}
+        </button>
+        <p className="note">
+          Deletes the current image and any generated MP3s. Nothing is
+          backed up. Required before picking a new image.
+        </p>
       </div>
     </main>
   );

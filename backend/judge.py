@@ -9,13 +9,10 @@ and its network client aren't needed until a request actually calls the judge.
 
 import base64
 import io
-import json
 
-import anthropic
 from PIL import Image
 
-JUDGE_MODEL = "claude-sonnet-5"
-_client = anthropic.Anthropic()
+from judge_client import call_judge
 
 # Vision models don't benefit from full-resolution originals and a smaller payload
 # means a faster round trip. 1024px on the long side is comfortably above what the
@@ -103,10 +100,9 @@ def judge_image(image_bytes: bytes, tags: list[str]) -> list[dict]:
     tag_list = "\n".join(f"- {tag}" for tag in tags)
     prompt = JUDGE_PROMPT_TEMPLATE.format(tag_list=tag_list, tag_count=len(tags))
 
-    response = _client.messages.create(
-        model=JUDGE_MODEL,
+    parsed = call_judge(
         max_tokens=2048,
-        output_config={"format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
+        schema=JUDGE_SCHEMA,
         messages=[
             {
                 "role": "user",
@@ -124,8 +120,6 @@ def judge_image(image_bytes: bytes, tags: list[str]) -> list[dict]:
             }
         ],
     )
-    text_block = next(b for b in response.content if b.type == "text")
-    parsed = json.loads(text_block.text)
     verdicts_by_tag = {v["tag"]: v for v in parsed.get("verdicts", []) if "tag" in v}
 
     result = []

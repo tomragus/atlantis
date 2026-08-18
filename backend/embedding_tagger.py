@@ -127,9 +127,19 @@ def _embed_vocabulary(algorithm: str) -> dict[str, torch.Tensor]:
     return vectors_by_facet
 
 
+def _open_image(image_bytes: bytes) -> Image.Image:
+    """Decodes uploaded bytes into an RGB PIL image, converting away any alpha/
+    palette channel every embedding model's preprocessing expects not to see.
+
+    Shared by `_embed_image` and `generate_caption` -- both start from the same
+    raw upload.
+    """
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+
 def _embed_image(algorithm: str, image_bytes: bytes) -> torch.Tensor:
     state = _state[algorithm]
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = _open_image(image_bytes)
     if algorithm == "coca":
         pixels = state.preprocess(image).unsqueeze(0).to(state.device)
         with torch.no_grad():
@@ -219,19 +229,40 @@ def _load(algorithm: str) -> None:
         state.ready = True
 
 
+def embed_image(image_bytes: bytes, algorithm: str = DEFAULT_ALGORITHM) -> torch.Tensor:
+    """Loads the algorithm (if needed) and embeds the image, once.
+
+    A request that needs both `tags_by_facet` and `embedding_projection` for
+    the same image (main.py's /tag route does, for every algorithm) can
+    compute the vector here once and pass it into both via their
+    `image_vector` parameter, instead of paying for a second forward pass
+    through the model for the same image.
+    """
+    _load(algorithm)
+    return _embed_image(algorithm, image_bytes)
+
+
 def tags_by_facet(
-    image_bytes: bytes, algorithm: str = DEFAULT_ALGORITHM
+    image_bytes: bytes,
+    algorithm: str = DEFAULT_ALGORITHM,
+    image_vector: torch.Tensor | None = None,
 ) -> dict[str, list[tuple[str, float]]]:
     """Every adjective in every facet, ranked best-first, with its score.
 
-    The full ranking rather than just the quota's worth, so a caller (the judge
-    replacement flow in main.py) can swap a flagged tag for the next-best word in
-    the same facet without re-embedding the image.
+    The full ranking rather than just the quota's worth, so main.py's tagging
+    summary can show the next-best runners-up (the "top 20 candidates" list
+    and the embedding plot) alongside whichever tags actually survived the
+    judges, without re-embedding the image.
+
+    `image_vector` lets a caller that already embedded this image (via
+    `embed_image`) skip doing it again; if omitted, this embeds it itself,
+    same as before.
     """
     _load(algorithm)
     state = _state[algorithm]
 
-    image_vector = _embed_image(algorithm, image_bytes)
+    if image_vector is None:
+        image_vector = _embed_image(algorithm, image_bytes)
 
     ranked: dict[str, list[tuple[str, float]]] = {}
     for facet, words in ADJECTIVES.items():
@@ -247,8 +278,13 @@ def tags_by_facet(
             # raw cosine similarity on the model's own scale, un-normalized further.
             score = similarity
         order = torch.argsort(score, descending=True)
+        # Full precision, not rounded to a fixed number of decimals: rounding to 4
+        # places here would silently floor any score below 0.00005 to exactly 0.0,
+        # which is indistinguishable from "no match at all" by the time it reaches
+        # the frontend. The frontend's own formatScore() decides how to display a
+        # tiny-but-nonzero value (scientific notation below 0.001).
         ranked[facet] = [
-            (words[int(index)], round(float(score[index]), 4)) for index in order
+            (words[int(index)], float(score[index])) for index in order
         ]
     return ranked
 
@@ -257,6 +293,7 @@ def embedding_projection(
     image_bytes: bytes,
     points: list[tuple[str, str]],
     algorithm: str = DEFAULT_ALGORITHM,
+    image_vector: torch.Tensor | None = None,
 ) -> dict:
     """2D PCA layout of the given (word, facet) points, with the image vector
     projected onto that same basis.
@@ -277,11 +314,16 @@ def embedding_projection(
     into an unreadable smear. The frontend clamps the projected image point to the
     plot's edge when it falls outside the tags' bounds rather than rescaling
     around it.
+
+    `image_vector` lets a caller that already embedded this image (via
+    `embed_image`) skip doing it again; if omitted, this embeds it itself,
+    same as before.
     """
     _load(algorithm)
     state = _state[algorithm]
 
-    image_vector = _embed_image(algorithm, image_bytes)  # 1 x D
+    if image_vector is None:
+        image_vector = _embed_image(algorithm, image_bytes)  # 1 x D
     word_vectors = torch.stack(
         [
             state.text_vectors[facet][ADJECTIVES[facet].index(word)]
@@ -325,7 +367,7 @@ def generate_caption(image_bytes: bytes) -> str:
 
     import open_clip
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = _open_image(image_bytes)
     pixels = state.preprocess(image).unsqueeze(0).to(state.device)
     with torch.no_grad():
         # top_k rather than the default beam_search: see _patch_open_clip_generate
@@ -365,60 +407,29 @@ def select_tags(ranked: dict[str, list[tuple[str, float]]]) -> tuple[list[str], 
 def word_to_facet(ranked: dict[str, list[tuple[str, float]]]) -> dict[str, str]:
     """Flattens the ranked-by-facet structure into a word -> facet lookup.
 
-    Shared by `replace_flagged_tags` below and main.py's tagging summary --
-    both need to know which facet a given word came from.
+    Used by main.py's tagging summary to label each tag with the facet it
+    came from.
     """
     return {word: facet for facet, candidates in ranked.items() for word, _ in candidates}
 
 
-def replace_flagged_tags(
-    ranked: dict[str, list[tuple[str, float]]],
+def drop_flagged_tags(
     tags: list[str],
     scores: dict[str, float],
     flagged: set[str],
-) -> tuple[list[str], dict[str, float], dict[str, str]]:
-    """Swaps each flagged tag for the next-best unused word in its own facet.
+) -> tuple[list[str], dict[str, float]]:
+    """Removes every flagged tag from the list -- no replacement is picked.
 
-    Same-facet rather than a flat nearest-match, so a flagged mood word is
-    replaced by another mood word and the quota mix (color:2, light:1, mood:3,
-    texture:2, energy:1, style:1) never skews. If a facet's candidates are all
-    already in use, the original tag is kept rather than dropped.
-
-    The third return value maps each flagged tag that was actually swapped to
-    its replacement -- callers that surface the judging process (main.py's
-    history record) use it to show what replaced what. Tags kept despite being
-    flagged (facet exhausted) are omitted from this mapping.
+    A judge flagging a word is a statement that the word doesn't belong, not
+    that some other word from the same facet does; dropping it outright keeps
+    the tag list honest about what's actually a good fit, at the cost of a
+    shorter (and per-facet, uneven) final list. No floor on how few tags can
+    remain -- if every tag gets flagged across both judges, the prompt sent to
+    Suno just has fewer (or no) tags.
     """
-    facet_of = word_to_facet(ranked)
-    used = set(tags)
-
-    new_tags: list[str] = []
-    new_scores = dict(scores)
-    replacements: dict[str, str] = {}
-    for tag in tags:
-        if tag not in flagged:
-            new_tags.append(tag)
-            continue
-
-        facet = facet_of[tag]
-        replacement = next((c for c in ranked[facet] if c[0] not in used), None)
-        if replacement is None:
-            # Every candidate in this facet is already in the tag list -- the
-            # facet's vocabulary is too small relative to its quota for this
-            # image. Visible in the terminal so a systematic case doesn't go
-            # unnoticed, same as judge.py's own fallback for a missing verdict.
-            print(f"embedding_tagger: facet exhausted, keeping flagged tag {tag!r}")
-            new_tags.append(tag)
-            continue
-
-        word, score = replacement
-        used.add(word)
-        new_tags.append(word)
-        new_scores[word] = score
-        replacements[tag] = word
-
-    new_tags, new_scores = _ordered_by_score(new_tags, new_scores)
-    return new_tags, new_scores, replacements
+    new_tags = [tag for tag in tags if tag not in flagged]
+    new_scores = {tag: scores[tag] for tag in new_tags}
+    return new_tags, new_scores
 
 
 def siglip_tags_by_facet(image_bytes: bytes) -> dict[str, list[tuple[str, float]]]:

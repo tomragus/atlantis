@@ -77,7 +77,7 @@ cd eval
   ground-truth manifest, no CI integration, no comparison against any model
   other than `gemma3:12b`. `embedding_tagger.py` is no longer entirely out of
   scope: the live app's `/tag` now calls the judge (`backend/judge.py`,
-  the same module this script imports) and replaces any flagged tag with the
-  next-nearest same-facet candidate via `embedding_tagger.replace_flagged_tags()`.
-  This eval script itself still only reports what the judge flags -- it does
-  not exercise the replacement path.
+  the same module this script imports) and drops any flagged tag from the
+  list outright via `embedding_tagger.drop_flagged_tags()` -- no replacement
+  is picked. This eval script itself still only reports what the judge flags
+  -- it does not exercise the drop path.

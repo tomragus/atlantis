@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -33,15 +34,14 @@ GIVE_UP_AFTER_SECONDS = 300
 # under us. Options: V4, V4_5, V4_5ALL, V4_5PLUS, V5, V5_5. All cost 11 credits.
 SUNO_MODEL_VERSION = "V5_5"
 
-# Everything generated is kept here so past runs can be cross-referenced.
+# Generated audio is downloaded here so playback doesn't depend on apiframe's
+# CDN links staying alive -- not a run history, just this run's working copy.
+# Wiped by DELETE /history (see below) before a new image can be picked.
 # Paths are relative to this file, so the server can be started from anywhere.
 HISTORY_DIR = Path(__file__).parent / "history"
-IMAGES_DIR = HISTORY_DIR / "images"
 AUDIO_DIR = HISTORY_DIR / "audio"
-HISTORY_FILE = HISTORY_DIR / "history.jsonl"
 
-for directory in (IMAGES_DIR, AUDIO_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 # The Next.js dev server is a different origin, which browsers block by default.
 app.add_middleware(
@@ -136,7 +136,7 @@ def request_song(prompt: str) -> dict:
 
 
 def safe_for_filename(text: str) -> str:
-    """Strips anything from a genre or title that would break a path.
+    """Strips anything from a genre, title, or filename that would break a path.
 
     Hyphens survive even though `-` also separates the fields in these names: nine
     genres contain one, and the names are read by people rather than parsed.
@@ -145,60 +145,72 @@ def safe_for_filename(text: str) -> str:
     return kept or "untitled"
 
 
-def audio_filename(stamp: datetime, genre: str, title: str, take: int) -> str:
-    """Names a track for browsing: date, time, genre, Suno's title, take number.
+def image_base_name(filename: str | None) -> str:
+    """The uploaded image's own filename, sanitized for reuse in the audio filename.
 
-    Neither `/` nor `:` can appear in a filename, so the date and time use hyphens
-    and underscores instead.
+    `Path(...).stem` drops both the extension and any directory components a
+    client could smuggle in via the filename field. Falls back to "untitled" if
+    the frontend sent an empty string (its default when it has no file name to
+    give).
     """
-
-    when = stamp.strftime("%m-%d-%Y_%H_%M_%S")
-    label = safe_for_filename(genre) if genre else "no_genre"
-    return f"{when}-{label}-{safe_for_filename(title)}-{take}.mp3"
+    stem = Path(filename).stem if filename else ""
+    return safe_for_filename(stem) if stem else "untitled"
 
 
-def save_to_history(
-    image_bytes: bytes,
-    media_type: str,
-    tags: list[str],
-    tag_scores: dict,
-    prompt: str,
+def audio_filename(image_name: str, algorithm: str, take: int, stamp: datetime) -> str:
+    """Names a track for browsing: which image, which algorithm tagged it, which
+    take, and the date -- e.g. "sunset-beach-clip-1-08-17-2026.mp3".
+
+    Date-only rather than a full timestamp: a same-day collision (same image name,
+    algorithm, and take twice in one day) falls back to the short-uuid suffix in
+    `save_audio` below.
+    """
+    when = stamp.strftime("%m-%d-%Y")
+    return f"{image_name}-{algorithm}-{take}-{when}.mp3"
+
+
+def save_audio(
+    original_filename: str | None,
     job: dict,
-    genre: str,
-    tagging: dict,
     algorithm: str,
-) -> dict:
-    """Writes the image, every take Suno rendered, and one JSONL row for the run.
+) -> list[dict]:
+    """Downloads every take Suno rendered for this run to local disk.
 
     The MP3s are copied locally because apiframe's retention policy for its CDN
-    links is undocumented, so a history of URLs alone could rot into dead links.
+    links is undocumented, so pointing the player straight at `audioUrl` could
+    rot into a dead link. This is scratch space for the current run only -- no
+    JSONL row, no image copy -- wiped by `DELETE /history` before the next run.
     """
-    stamp = datetime.now(timezone.utc)
-    # Timestamp sorts chronologically; the short uuid keeps two uploads in the
-    # same second from overwriting each other.
-    stem = f"{stamp.strftime('%Y-%m-%dT%H-%M-%S')}_{uuid4().hex[:8]}"
-
-    image_name = f"{stem}.{media_type.removeprefix('image/')}"
-    (IMAGES_DIR / image_name).write_bytes(image_bytes)
-
-    # Audio is named for browsing rather than sorting, so local time.
-    local_stamp = stamp.astimezone()
+    stamp = datetime.now(timezone.utc).astimezone()
+    image_label = image_base_name(original_filename)
 
     # Suno renders two takes per job and both are kept: they cost nothing extra,
-    # and one is usually the better listen.
+    # and one is usually the better listen. The two downloads are independent
+    # I/O with no shared state, so fetch them concurrently rather than waiting
+    # on one before starting the next; the collision-checking/write loop below
+    # stays sequential (and in take order) since it does touch shared state
+    # (the filesystem, and `destination.exists()` checks against files this
+    # same call is writing).
+    raw_tracks = job["result"]["tracks"]
+    with ThreadPoolExecutor(max_workers=max(len(raw_tracks), 1)) as executor:
+        downloads = list(
+            executor.map(lambda t: requests.get(t["audioUrl"], timeout=120), raw_tracks)
+        )
+
     tracks = []
-    for index, track in enumerate(job["result"]["tracks"]):
-        download = requests.get(track["audioUrl"], timeout=120)
+    for index, (track, download) in enumerate(zip(raw_tracks, downloads)):
         if not download.ok:
             # Without this check an error page would be written under an .mp3 name
             # and recorded as a success, surfacing later as a track that won't play.
             continue
 
-        audio_name = audio_filename(local_stamp, genre, track["title"], index + 1)
+        audio_name = audio_filename(image_label, algorithm, index + 1, stamp)
         destination = AUDIO_DIR / audio_name
         if destination.exists():
-            # Two runs in the same second sharing a genre and title would
-            # otherwise silently overwrite each other's audio.
+            # Date-only granularity means the same image name, algorithm, and take
+            # collide easily within a single day, so this fallback is the normal
+            # case for a second run of the same image on the same day, not just a
+            # rare coincidence.
             audio_name = f"{destination.stem}_{uuid4().hex[:4]}.mp3"
             destination = AUDIO_DIR / audio_name
         destination.write_bytes(download.content)
@@ -216,68 +228,27 @@ def save_to_history(
             502, "Suno rendered the song but none of its takes could be downloaded."
         )
 
-    record = {
-        "timestamp": stamp.isoformat(),
-        "image": f"images/{image_name}",
-        # Empty when the user picked no genre, in which case nothing was
-        # prepended and the prompt is purely the image's tags.
-        "genre": genre,
-        "algorithm": algorithm,
-        "tags": tags,
-        "tag_scores": tag_scores,
-        "tagging": tagging,
-        "prompt": prompt,
-        "job_id": job["id"],
-        "tracks": tracks,
-    }
-    # CoCa's caption is display-only (never touches tag selection or the Suno
-    # prompt) but worth keeping on the history record when it was generated.
-    if "caption" in tagging:
-        record["caption"] = tagging["caption"]
-
-    with HISTORY_FILE.open("a") as history:
-        history.write(json.dumps(record) + "\n")
-
-    return record
-
-
-def iter_history():
-    """Past runs newest first, decoded one row at a time."""
-    if not HISTORY_FILE.exists():
-        return
-    for line in reversed(HISTORY_FILE.read_text().splitlines()):
-        if line.strip():
-            yield json.loads(line)
-
-
-@app.get("/history")
-def read_history() -> list[dict]:
-    """Every past run, newest first."""
-    return list(iter_history())
+    return tracks
 
 
 @app.delete("/history")
 def wipe_history() -> dict:
-    """Deletes every saved image, MP3 and history row. Not reversible."""
-    # Counting lines is enough; parsing every record just to discard it is not.
-    entries = 0
-    if HISTORY_FILE.exists():
-        entries = sum(1 for line in HISTORY_FILE.read_text().splitlines() if line.strip())
+    """Deletes every MP3 downloaded so far this run. Not reversible.
 
+    Called by the frontend's Clear button before a new image can be picked --
+    the app only ever holds one image's run at a time, so this is a full wipe,
+    not a selective one.
+    """
     files_removed = 0
     bytes_freed = 0
 
-    for directory in (IMAGES_DIR, AUDIO_DIR):
-        for path in directory.iterdir():
-            if path.is_file():
-                bytes_freed += path.stat().st_size
-                path.unlink()
-                files_removed += 1
-
-    HISTORY_FILE.unlink(missing_ok=True)
+    for path in AUDIO_DIR.iterdir():
+        if path.is_file():
+            bytes_freed += path.stat().st_size
+            path.unlink()
+            files_removed += 1
 
     return {
-        "entries_removed": entries,
         "files_removed": files_removed,
         "megabytes_freed": round(bytes_freed / 1_000_000, 1),
     }
@@ -300,49 +271,53 @@ def list_algorithms() -> list[dict]:
 
 def build_tagging_summary(
     ranked: dict,
-    selected_tags: list[str],
-    selected_scores: dict,
+    facet_of: dict,
     verdicts: list[dict],
+    contradictions: list[dict],
     final_tags: list[str],
     final_scores: dict,
-    replacements: dict,
 ) -> dict:
-    """Assembles everything the frontend needs to show how the 10 tags were picked.
+    """Assembles everything the frontend needs to show how the tags were picked.
 
     `ranked` already holds every candidate word per facet (see
     `siglip_tags_by_facet`), so this is pure bookkeeping: no re-scoring.
+    `facet_of` is passed in rather than recomputed here since the caller
+    (`tag()` below) already builds it from the same `ranked` for the
+    contradiction judge -- no reason to derive it from scratch twice.
     """
-    # Deferred like the other embedding_tagger imports in `tag()` below -- this
-    # function is only ever called from there, after torch is already loaded,
-    # but importing it lazily here too keeps `build_tagging_summary` correct
-    # to call on its own rather than relying on caller-side import ordering.
-    from embedding_tagger import word_to_facet
-
-    facet_of = word_to_facet(ranked)
-
-    top20 = sorted(
-        (
-            {"tag": word, "facet": facet, "score": score}
-            for facet, candidates in ranked.items()
-            for word, score in candidates
-        ),
+    # The final tags are picked per-facet by quota (see select_tags), not by a flat
+    # global top-N, so a naive top-20-by-score over the whole vocabulary can miss
+    # some of them entirely -- a facet-dominant word from another facet would
+    # outscore a final tag from an under-represented one. Guarantee every final tag
+    # appears, then fill the rest of the 20 slots with the next best-scoring
+    # candidates that aren't already final, so "top 20" always means "the tags that
+    # were actually picked, plus the next-best runners-up" -- and so the embedding
+    # plot below (which projects exactly these 20 points) never shows a final tag
+    # dimmed as unselected.
+    final_tag_set = set(final_tags)
+    all_candidates = [
+        {"tag": word, "facet": facet, "score": score}
+        for facet, candidates in ranked.items()
+        for word, score in candidates
+    ]
+    runners_up = sorted(
+        (entry for entry in all_candidates if entry["tag"] not in final_tag_set),
         key=lambda entry: entry["score"],
         reverse=True,
-    )[:20]
+    )[: max(20 - len(final_tag_set), 0)]
+    top20 = sorted(
+        [entry for entry in all_candidates if entry["tag"] in final_tag_set] + runners_up,
+        key=lambda entry: entry["score"],
+        reverse=True,
+    )
 
     return {
         "top20": top20,
-        "selected": [
-            {"tag": tag, "facet": facet_of[tag], "score": selected_scores[tag]}
-            for tag in selected_tags
-        ],
         "judge": verdicts,
+        "contradictions": contradictions,
         "final": [
             {"tag": tag, "facet": facet_of[tag], "score": final_scores[tag]}
             for tag in final_tags
-        ],
-        "replacements": [
-            {"from": old, "to": new} for old, new in replacements.items()
         ],
     }
 
@@ -360,45 +335,74 @@ def tag(image: UploadFile = File(...), genre: str = "", algorithm: str = "siglip
     # Imported here rather than at module level so `import main` stays fast and
     # torch/anthropic are only loaded once an actual request needs them.
     from embedding_tagger import (
+        embed_image,
         tags_by_facet,
         select_tags,
-        replace_flagged_tags,
+        drop_flagged_tags,
+        word_to_facet,
         embedding_projection,
         generate_caption,
     )
     from judge import judge_image
+    from contradiction_judge import judge_contradictions
 
     validate_genre(genre)
     validate_algorithm(algorithm)
 
     image_bytes = read_image(image)
-    ranked = tags_by_facet(image_bytes, algorithm=algorithm)
+    # Computed once and reused below for the embedding-space plot -- tags_by_facet
+    # and embedding_projection both need this image's vector, and it's the same
+    # vector either way (same image, same algorithm), so there's no reason to run
+    # the model over the image twice in one request.
+    image_vector = embed_image(image_bytes, algorithm=algorithm)
+    ranked = tags_by_facet(image_bytes, algorithm=algorithm, image_vector=image_vector)
     tags, tag_scores = select_tags(ranked)
-    selected_tags, selected_scores = tags, tag_scores
+    facet_of = word_to_facet(ranked)
 
     # The judge is a quality improvement, not a hard dependency: if the Claude
     # call errors (rate limit, timeout, missing key), fall back to the untouched
     # embedding tags rather than failing a request that Suno could still render.
     # Runs identically regardless of which algorithm produced the tags it reviews.
+    # A flagged tag is dropped outright rather than replaced -- the judge is
+    # saying the word doesn't belong, not that some other word from the same
+    # facet does, so the tag list just gets shorter.
     verdicts: list[dict] = []
-    replacements: dict[str, str] = {}
     try:
         verdicts = judge_image(image_bytes, tags)
         flagged = {v["tag"] for v in verdicts if v["flagged"]}
         if flagged:
-            tags, tag_scores, replacements = replace_flagged_tags(
-                ranked, tags, tag_scores, flagged
-            )
+            tags, tag_scores = drop_flagged_tags(tags, tag_scores, flagged)
     except Exception as exc:
         print(f"judge call failed, using unjudged tags: {exc}")
 
+    # Second pass: the per-tag judge above scores each tag in isolation, so it
+    # can't catch two tags from different facets that contradict each other's
+    # mood (e.g. "joyful" from valence next to "haunting" from mood). Runs on
+    # the tags the first judge already settled, same degrade-gracefully
+    # contract and same drop-outright behavior -- this judge only decides
+    # *which* tag of a contradicting pair to drop.
+    contradictions: list[dict] = []
+    try:
+        contradictions = judge_contradictions(tags, facet_of)
+        drop = {c["drop"] for c in contradictions}
+        if drop:
+            tags, tag_scores = drop_flagged_tags(tags, tag_scores, drop)
+    except Exception as exc:
+        print(f"contradiction judge call failed, using tags as-is: {exc}")
+
     tagging = build_tagging_summary(
-        ranked, selected_tags, selected_scores, verdicts, tags, tag_scores, replacements
+        ranked,
+        facet_of,
+        verdicts,
+        contradictions,
+        tags,
+        tag_scores,
     )
     tagging["embedding"] = embedding_projection(
         image_bytes,
         [(point["tag"], point["facet"]) for point in tagging["top20"]],
         algorithm=algorithm,
+        image_vector=image_vector,
     )
 
     # CoCa-only: a free-text caption, display-only -- never fed into the tags or
@@ -421,7 +425,7 @@ def tag(image: UploadFile = File(...), genre: str = "", algorithm: str = "siglip
 
 @app.post("/generate")
 def generate(
-    image: UploadFile = File(...),
+    image_filename: str = Form(""),
     genre: str = "",
     algorithm: str = "siglip",
     tags: str = Form(...),
@@ -429,31 +433,33 @@ def generate(
     tagging: str = Form(...),
     prompt: str = Form(...),
 ):
-    """Renders and saves a song from a `/tag` response the frontend already has.
+    """Renders a song from a `/tag` response the frontend already has.
 
     Deliberately does no tagging of its own -- the image, tags, and judge
-    verdicts were already settled in `/tag`, so this step is Suno + history only.
-    `algorithm` isn't used for anything here except recording which one produced
-    the tags being rendered -- validating it doesn't need embedding_tagger's heavy
-    imports, so it's checked against the lightweight `algorithms` module instead.
+    verdicts were already settled in `/tag`, so this step is Suno + audio
+    download only. `image_filename` is only needed for the audio naming
+    convention, not the image itself -- nothing here persists the image, so
+    unlike `/tag` there's no reason to make the frontend re-upload the whole
+    file just to read its name back. `algorithm` isn't used for anything
+    here except naming the downloaded file -- validating it doesn't need
+    embedding_tagger's heavy imports, so it's checked against the
+    lightweight `algorithms` module instead.
     """
     validate_genre(genre)
     validate_algorithm(algorithm)
 
-    image_bytes = read_image(image)
     job = request_song(prompt)
+    tracks = save_audio(image_filename, job, algorithm)
 
-    return save_to_history(
-        image_bytes,
-        image.content_type,
-        json.loads(tags),
-        json.loads(tag_scores),
-        prompt,
-        job,
-        genre,
-        json.loads(tagging),
-        algorithm,
-    )
+    return {
+        "algorithm": algorithm,
+        "tags": json.loads(tags),
+        "tag_scores": json.loads(tag_scores),
+        "tagging": json.loads(tagging),
+        "prompt": prompt,
+        "job_id": job["id"],
+        "tracks": tracks,
+    }
 
 
 # Serves the saved images and MP3s, so the frontend can play a song from local
