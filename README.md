@@ -1,4 +1,4 @@
-# Image to Song
+# Ideagream Studio
 
 Upload a picture and (optionally) spin a genre knob; the backend embeds the
 image in SigLIP space, scores it against a fixed adjective vocabulary to pull

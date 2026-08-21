@@ -11,7 +11,7 @@ already applies to its own deferred imports.
 
 from fastapi import HTTPException
 
-ALGORITHMS = ["siglip", "clip", "align", "metaclip", "coca"]
+ALGORITHMS = ["siglip", "clip", "align", "metaclip"]
 DEFAULT_ALGORITHM = "siglip"
 
 # Display label + one-line blurb per algorithm, for the frontend's algorithm-picker
@@ -22,7 +22,7 @@ DEFAULT_ALGORITHM = "siglip"
 # can stay algorithm-aware without repeating that reasoning per view.
 ALGORITHM_INFO = {
     "siglip": {
-        "label": "SigLIP",
+        "label": "SigLIP2",
         "blurb": "Today's default. Sigmoid-calibrated match probability (0-1).",
     },
     "clip": {
@@ -36,10 +36,6 @@ ALGORITHM_INFO = {
     "metaclip": {
         "label": "MetaCLIP",
         "blurb": "Meta's reproduction of CLIP's data curation. Raw cosine similarity.",
-    },
-    "coca": {
-        "label": "CoCa",
-        "blurb": "Also captions the image in free text, shown alongside its tags.",
     },
 }
 

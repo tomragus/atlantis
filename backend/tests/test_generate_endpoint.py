@@ -37,7 +37,7 @@ def _generate_form(**overrides):
         "image_filename": "sunset.png",
         "tags": json.dumps(["gritty", "warm"]),
         "tag_scores": json.dumps({"gritty": 0.5, "warm": 0.6}),
-        "tagging": json.dumps({"top20": [], "judge": [], "contradictions": [], "final": []}),
+        "tagging": json.dumps({"judge": [], "contradictions": [], "final": []}),
         "prompt": "jazz, gritty, warm",
     }
     form.update(overrides)

@@ -2,7 +2,7 @@
 
 Every adjective in `vocabulary.ADJECTIVES` is scored against the image and the best
 in each facet kept, so the same image always produces the same tags. This module
-supports five embedding algorithms (SigLIP, CLIP, ALIGN, MetaCLIP, CoCa) through one
+supports four embedding algorithms (SigLIP, CLIP, ALIGN, MetaCLIP) through one
 shared tagging/PCA code path, keyed by an `algorithm` argument -- each keeps its own
 lazily-loaded model/processor/vocabulary-vectors, mirroring the single-model pattern
 this file started as.
@@ -10,11 +10,11 @@ this file started as.
 SigLIP is the default rather than CLIP because it is trained with a pairwise sigmoid
 loss, scoring each image/text pair on its own. CLIP's softmax makes candidate labels
 compete for a fixed budget of probability, the wrong shape for ten independent
-attributes. The other three HF algorithms (CLIP, ALIGN, MetaCLIP) and CoCa are offered
+attributes. The other two HF algorithms (CLIP, ALIGN) and MetaCLIP are offered
 alongside it to show off how each model's embedding space differs, not to out-score
 it -- so, per plan, none of them get a calibrated probability transform: only SigLIP
 has a trained logit_scale/logit_bias to turn cosine similarity into one, so the other
-four score with raw cosine similarity on their own native scale.
+three score with raw cosine similarity on their own native scale.
 """
 
 import io
@@ -40,24 +40,13 @@ HF_MODEL_IDS = {
     "metaclip": "facebook/metaclip-b32-400m",
 }
 
-# CoCa isn't in transformers -- it needs open_clip's own create/tokenize/encode API,
-# loaded only when this algorithm is actually requested (see _load below).
-COCA_MODEL_NAME = "coca_ViT-B-32"
-# The mscoco-finetuned checkpoint rather than the base contrastive one: it's the
-# variant open_clip trains specifically for the captioning head this app uses.
-COCA_PRETRAINED = "mscoco_finetuned_laion2b_s13b_b90k"
-
-# Human-readable model id per algorithm, surfaced in embedding_projection's "model"
-# field and (via main.py's GET /algorithms) to the frontend.
-MODEL_IDS = {**HF_MODEL_IDS, "coca": f"open_clip:{COCA_MODEL_NAME}/{COCA_PRETRAINED}"}
-
 
 @dataclass
 class _AlgorithmState:
     """Everything one algorithm needs, loaded lazily behind its own lock.
 
     Was a single set of module-level globals when this file only supported SigLIP;
-    replaced with one instance per algorithm so five models' weights/processors never
+    replaced with one instance per algorithm so four models' weights/processors never
     collide, each still loading -- and locking -- independently of the others.
     """
 
@@ -66,13 +55,9 @@ class _AlgorithmState:
     text_vectors: dict[str, torch.Tensor] = field(default_factory=dict)
     ready: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
-    # HF algorithms only.
     processor: object = None
     logit_scale: float = 0.0
     logit_bias: float = 0.0
-    # CoCa only.
-    tokenizer: object = None
-    preprocess: object = None
 
 
 _state: dict[str, _AlgorithmState] = {name: _AlgorithmState() for name in ALGORITHMS}
@@ -100,17 +85,12 @@ def _embed_vocabulary(algorithm: str) -> dict[str, torch.Tensor]:
     per_template = []
     for template in TEMPLATES:
         prompts = [template.format(word) for word in words]
-        if algorithm == "coca":
-            tokens = state.tokenizer(prompts).to(state.device)
-            with torch.no_grad():
-                vectors = state.model.encode_text(tokens, normalize=False)
-        else:
-            inputs = state.processor(
-                text=prompts, padding="max_length", truncation=True, return_tensors="pt"
-            ).to(state.device)
-            with torch.no_grad():
-                # This transformers version returns an output object, not a bare tensor.
-                vectors = state.model.get_text_features(**inputs).pooler_output
+        inputs = state.processor(
+            text=prompts, padding="max_length", truncation=True, return_tensors="pt"
+        ).to(state.device)
+        with torch.no_grad():
+            # This transformers version returns an output object, not a bare tensor.
+            vectors = state.model.get_text_features(**inputs).pooler_output
         per_template.append(torch.nn.functional.normalize(vectors, dim=-1))
 
     averaged = torch.nn.functional.normalize(
@@ -130,9 +110,6 @@ def _embed_vocabulary(algorithm: str) -> dict[str, torch.Tensor]:
 def _open_image(image_bytes: bytes) -> Image.Image:
     """Decodes uploaded bytes into an RGB PIL image, converting away any alpha/
     palette channel every embedding model's preprocessing expects not to see.
-
-    Shared by `_embed_image` and `generate_caption` -- both start from the same
-    raw upload.
     """
     return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
@@ -140,42 +117,10 @@ def _open_image(image_bytes: bytes) -> Image.Image:
 def _embed_image(algorithm: str, image_bytes: bytes) -> torch.Tensor:
     state = _state[algorithm]
     image = _open_image(image_bytes)
-    if algorithm == "coca":
-        pixels = state.preprocess(image).unsqueeze(0).to(state.device)
-        with torch.no_grad():
-            vector = state.model.encode_image(pixels, normalize=False)
-    else:
-        inputs = state.processor(images=image, return_tensors="pt").to(state.device)
-        with torch.no_grad():
-            vector = state.model.get_image_features(**inputs).pooler_output
+    inputs = state.processor(images=image, return_tensors="pt").to(state.device)
+    with torch.no_grad():
+        vector = state.model.get_image_features(**inputs).pooler_output
     return torch.nn.functional.normalize(vector, dim=-1)
-
-
-def _patch_open_clip_generate(open_clip) -> None:
-    """Works around an open_clip/transformers version mismatch in CoCa's `.generate()`.
-
-    open_clip.coca_model imports `BeamSearchScorer` from `transformers` at module
-    load time and, if that single name fails to import, swallows the ImportError and
-    disables *all* of `.generate()` -- including the top_k/top_p decoding paths,
-    which never touch `BeamSearchScorer` at runtime. `transformers==5.14.1` (pinned
-    for the other four algorithms' `.pooler_output` shape -- see requirements.txt)
-    has removed `BeamSearchScorer` entirely, so CoCa's captioning would otherwise be
-    dead on arrival under this repo's pin. Re-supplies the working top_k/top_p
-    classes open_clip already successfully imported before hitting the missing name,
-    so `generate(..., generation_type="top_k")` (used by `generate_caption` below,
-    which never requests beam search) works without touching the pin.
-    """
-    from transformers import TopKLogitsWarper, TopPLogitsWarper
-
-    coca_model = open_clip.coca_model
-    if coca_model._has_transformers:
-        return
-    coca_model.GENERATION_TYPES = {
-        "top_k": TopKLogitsWarper,
-        "top_p": TopPLogitsWarper,
-        "beam_search": "beam_search",
-    }
-    coca_model._has_transformers = True
 
 
 def _load(algorithm: str) -> None:
@@ -197,33 +142,19 @@ def _load(algorithm: str) -> None:
 
         state.device = _pick_device()
 
-        if algorithm == "coca":
-            # Deferred: open_clip is a second, heavier ML dependency only needed
-            # when CoCa is actually picked.
-            import open_clip
+        model_id = HF_MODEL_IDS[algorithm]
+        state.model = AutoModel.from_pretrained(model_id).to(state.device).eval()
+        state.processor = AutoProcessor.from_pretrained(model_id)
 
-            _patch_open_clip_generate(open_clip)
-
-            model, _, preprocess = open_clip.create_model_and_transforms(
-                COCA_MODEL_NAME, pretrained=COCA_PRETRAINED
-            )
-            state.model = model.to(state.device).eval()
-            state.preprocess = preprocess
-            state.tokenizer = open_clip.get_tokenizer(COCA_MODEL_NAME)
-        else:
-            model_id = HF_MODEL_IDS[algorithm]
-            state.model = AutoModel.from_pretrained(model_id).to(state.device).eval()
-            state.processor = AutoProcessor.from_pretrained(model_id)
-
-            if algorithm == "siglip":
-                # Frozen, so read once as plain floats rather than re-exponentiating
-                # a tensor per facet per request. no_grad because they still carry a
-                # gradient. Only SigLIP has this calibration head -- CLIP/ALIGN/
-                # MetaCLIP score with raw cosine similarity instead (see module
-                # docstring).
-                with torch.no_grad():
-                    state.logit_scale = float(state.model.logit_scale.exp())
-                    state.logit_bias = float(state.model.logit_bias)
+        if algorithm == "siglip":
+            # Frozen, so read once as plain floats rather than re-exponentiating
+            # a tensor per facet per request. no_grad because they still carry a
+            # gradient. Only SigLIP has this calibration head -- CLIP/ALIGN/
+            # MetaCLIP score with raw cosine similarity instead (see module
+            # docstring).
+            with torch.no_grad():
+                state.logit_scale = float(state.model.logit_scale.exp())
+                state.logit_bias = float(state.model.logit_bias)
 
         state.text_vectors.update(_embed_vocabulary(algorithm))
         state.ready = True
@@ -249,10 +180,9 @@ def tags_by_facet(
 ) -> dict[str, list[tuple[str, float]]]:
     """Every adjective in every facet, ranked best-first, with its score.
 
-    The full ranking rather than just the quota's worth, so main.py's tagging
-    summary can show the next-best runners-up (the "top 20 candidates" list
-    and the embedding plot) alongside whichever tags actually survived the
-    judges, without re-embedding the image.
+    The full ranking rather than just the quota's worth, so `select_tags` and
+    `word_to_facet` in main.py can both work from the same per-facet
+    candidate pool without re-embedding the image.
 
     `image_vector` lets a caller that already embedded this image (via
     `embed_image`) skip doing it again; if omitted, this embeds it itself,
@@ -322,6 +252,17 @@ def embedding_projection(
     _load(algorithm)
     state = _state[algorithm]
 
+    if not points:
+        # Both judge passes can drop every tag they're handed, leaving nothing to
+        # plot. `torch.stack` on an empty list raises, so short-circuit before it --
+        # the frontend already treats an empty `points` list as "nothing to draw".
+        return {
+            "model": HF_MODEL_IDS[algorithm],
+            "source_dimensions": None,
+            "image": {"x": 0.0, "y": 0.0},
+            "points": [],
+        }
+
     if image_vector is None:
         image_vector = _embed_image(algorithm, image_bytes)  # 1 x D
     word_vectors = torch.stack(
@@ -345,7 +286,7 @@ def embedding_projection(
     image_x, image_y = ((image_vector - mean) @ basis).squeeze(0).tolist()
 
     return {
-        "model": MODEL_IDS[algorithm],
+        "model": HF_MODEL_IDS[algorithm],
         "source_dimensions": word_vectors.shape[-1],
         "image": {"x": image_x, "y": image_y},
         "points": [
@@ -353,29 +294,6 @@ def embedding_projection(
             for (word, facet), (x, y) in zip(points, word_coords)
         ],
     }
-
-
-def generate_caption(image_bytes: bytes) -> str:
-    """CoCa-only: a free-text caption from its captioning head.
-
-    Display-only, per plan -- never touches tag selection or the Suno prompt. Uses
-    the same lazily-loaded CoCa state as `tags_by_facet`/`embedding_projection`, so
-    calling this after (or before) either of those doesn't reload anything.
-    """
-    _load("coca")
-    state = _state["coca"]
-
-    import open_clip
-
-    image = _open_image(image_bytes)
-    pixels = state.preprocess(image).unsqueeze(0).to(state.device)
-    with torch.no_grad():
-        # top_k rather than the default beam_search: see _patch_open_clip_generate
-        # for why beam_search's BeamSearchScorer isn't available under this repo's
-        # pinned transformers version.
-        generated = state.model.generate(pixels, generation_type="top_k")
-    caption = open_clip.decode(generated[0]).split("<end_of_text>")[0]
-    return caption.replace("<start_of_text>", "").strip()
 
 
 def _ordered_by_score(tags: list[str], scores: dict[str, float]) -> tuple[list[str], dict[str, float]]:

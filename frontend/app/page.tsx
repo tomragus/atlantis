@@ -51,9 +51,9 @@ type EmbeddingPoint = {
   y: number;
 };
 
-// A 2D PCA projection of the top-20 candidates' vectors in the chosen
-// algorithm's embedding space, with the image vector projected onto that
-// same basis -- illustrative only, see `embedding_projection` in
+// A 2D PCA projection of the final tags' vectors in the chosen algorithm's
+// embedding space, with the image vector projected onto that same basis --
+// illustrative only, see `embedding_projection` in
 // backend/embedding_tagger.py for the caveats.
 type Embedding = {
   model: string;
@@ -62,13 +62,11 @@ type Embedding = {
   points: EmbeddingPoint[];
 };
 
-// How the final tags were arrived at: the full top-20 candidates, the first
-// judge's per-tag verdicts, the second judge's cross-facet contradiction
-// pairs, and the final tags -- each labeled with its facet. A tag either
-// judge flags is dropped outright, not replaced, so `final` can be shorter
-// than `top20`'s selected subset.
+// How the final tags were arrived at: the first judge's per-tag verdicts,
+// the second judge's cross-facet contradiction pairs, and the final tags --
+// each labeled with its facet. A tag either judge flags is dropped outright,
+// not replaced.
 type Tagging = {
-  top20: FacetTag[];
   judge: JudgeVerdict[];
   contradictions: Contradiction[];
   final: FacetTag[];
@@ -78,15 +76,6 @@ type Tagging = {
   // never ran at all, so this is what tells those two cases apart.
   judges_enabled: boolean;
   embedding?: Embedding;
-  // CoCa-only: a free-text caption from its captioning head. Display-only --
-  // never fed into tag selection or the Suno prompt.
-  caption?: string;
-  // The tagged image itself, as a data: URI -- sent back by the backend
-  // (which already had the bytes in memory either way) so the downloadable
-  // tag-analysis report can embed it directly, without the frontend fetching
-  // it a second time. See main.py's `/tag` docstring for why that second
-  // fetch is deliberately avoided for a sample-picker image.
-  image_data_url: string;
 };
 
 // Fixed hue order for the 8 facets, never reassigned/cycled per-render --
@@ -177,34 +166,6 @@ async function apiRequest(
   }
 }
 
-// Shared by every local-save action (a downloaded track, the tag-analysis
-// report): build a temporary object URL for the blob and click a hidden
-// link, since a blob's URL always belongs to this page regardless of where
-// the bytes came from.
-function downloadBlob(blob: Blob, filename: string) {
-  const objectUrl = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = objectUrl;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(objectUrl);
-}
-
-// The frontend (localhost:3000) and backend (127.0.0.1:8000) are different
-// origins, so a plain `<a download href={fileUrl(...)}>` won't reliably
-// force a save -- browsers ignore the `download` attribute cross-origin and
-// just navigate instead. Fetching the audio as a blob first and saving
-// *that* via downloadBlob works regardless of origin, since the blob URL
-// belongs to this page once created.
-async function downloadTrack(track: Track) {
-  const response = await fetch(fileUrl(track.audioFile));
-  if (!response.ok) throw new Error("Could not download the track.");
-  const blob = await response.blob();
-  downloadBlob(blob, track.audioFile.split("/").pop() ?? "track.mp3");
-}
-
 // Scores sit in a narrow band near zero (SigLIP's probabilities, and the other
 // algorithms' raw cosine similarities alike), so a flat 3 decimals reads as
 // "0.000" for the smallest ones -- indistinguishable from an actual zero. Below
@@ -216,21 +177,8 @@ function formatScore(score: number): string {
   return score.toFixed(3);
 }
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
 // Which of a judge pass's verdicts actually get shown as a dropped tag, and
-// what to say about each -- the data-shaping both JudgeReviewSection (JSX,
-// in TagBreakdown below) and judgeListHtml (the HTML report, in
-// algorithmSectionHtml below) render. Kept in one place so a future change
-// to what counts as "flagged" or how a contradiction's reason reads can't
-// update one presentation and silently miss the other.
+// what to say about each -- shared data-shaping for JudgeReviewSection below.
 type JudgeRow = { key: string; flaggedTag: string; reason: string };
 
 function flaggedJudgeRows(judge: JudgeVerdict[]): JudgeRow[] {
@@ -250,173 +198,6 @@ function contradictionRows(contradictions: Contradiction[]): JudgeRow[] {
   });
 }
 
-function tagTableRows(tags: FacetTag[], selected?: Set<string>): string {
-  return tags
-    .map(
-      ({ tag, facet, score }) => `
-        <tr${selected && !selected.has(tag) ? ' class="muted"' : ""}>
-          <td>${escapeHtml(tag)}</td>
-          <td>${escapeHtml(facet)}</td>
-          <td class="mono">${formatScore(score)}</td>
-        </tr>`,
-    )
-    .join("");
-}
-
-function judgeListHtml(
-  rows: { flaggedTag: string; reason: string }[],
-  emptyMessage: string,
-): string {
-  if (rows.length === 0) return `<p class="empty">${escapeHtml(emptyMessage)}</p>`;
-  return `<ul class="judge-list">${rows
-    .map(
-      (row) => `
-        <li><span class="flagged">${escapeHtml(row.flaggedTag)}</span> dropped
-          ${row.reason ? `<div class="reason">${escapeHtml(row.reason)}</div>` : ""}
-        </li>`,
-    )
-    .join("")}</ul>`;
-}
-
-// One algorithm's full tag-analysis section: final tags, CoCa's caption (if
-// any), both judge passes' verdicts, the top-20 candidate pool, and the
-// prompt actually sent to Suno -- the same fields TagBreakdown renders in
-// the UI, just as static HTML instead of React.
-function algorithmSectionHtml(algorithmLabel: string, analysis: Analysis): string {
-  const { tagging, prompt } = analysis;
-  const finalTagNames = new Set(tagging.final.map((f) => f.tag));
-
-  return `
-    <section class="algo">
-      <h2>${escapeHtml(algorithmLabel)}</h2>
-
-      ${
-        tagging.final.length > 0
-          ? `<table class="tags"><thead><tr><th>tag</th><th>facet</th><th>score</th></tr></thead>
-             <tbody>${tagTableRows(tagging.final)}</tbody></table>`
-          : `<p class="empty">No tags survived judging.</p>`
-      }
-
-      ${
-        tagging.caption
-          ? `<p class="caption"><span class="label">caption</span> &ldquo;${escapeHtml(tagging.caption)}&rdquo;</p>`
-          : ""
-      }
-
-      <h3>Judge review 1 &mdash; poor-quality tags</h3>
-      ${judgeListHtml(
-        flaggedJudgeRows(tagging.judge),
-        tagging.judges_enabled ? "Judge #1 found no tags that didn't fit the image's mood this run." : "LLM judges skipped.",
-      )}
-
-      <h3>Judge review 2 &mdash; contradictions</h3>
-      ${judgeListHtml(
-        contradictionRows(tagging.contradictions),
-        tagging.judges_enabled ? "Judge #2 identified no contradictory tags this run." : "LLM judges skipped.",
-      )}
-
-      ${
-        tagging.top20.length > 0
-          ? `<h3>Top 20 candidates</h3>
-             <table class="tags"><thead><tr><th>tag</th><th>facet</th><th>score</th></tr></thead>
-             <tbody>${tagTableRows(tagging.top20, finalTagNames)}</tbody></table>`
-          : ""
-      }
-
-      ${prompt ? `<p class="prompt"><span class="label">prompt sent to Suno</span> <span class="mono">${escapeHtml(prompt)}</span></p>` : ""}
-    </section>`;
-}
-
-// Builds a single, self-contained HTML document of the current run's full
-// tag analysis across every algorithm -- everything TagBreakdown shows in
-// the UI, minus the embedding plot (a live canvas, not something worth
-// statically rendering here) and any generated audio (out of scope for a
-// *tag* analysis report). The image comes from an algorithm's own
-// `tagging.image_data_url` (a data: URI baked in by the backend -- see the
-// `Tagging` type above) rather than the frontend's own `previewUrl`, so
-// this file is genuinely self-contained: it opens correctly later even
-// with the backend closed or an uploaded file's blob: URL long gone.
-function buildReportHtml({
-  results,
-  runAlgorithms,
-  algorithmLabels,
-  genre,
-}: {
-  results: Record<string, RunResult>;
-  runAlgorithms: string[];
-  algorithmLabels: Record<string, string>;
-  genre: string;
-}): string {
-  const imageSrc = runAlgorithms
-    .map((id) => results[id]?.analysis?.tagging.image_data_url)
-    .find((url): url is string => Boolean(url));
-
-  const sections = runAlgorithms
-    .map((id) => {
-      const result = results[id];
-      const label = algorithmLabels[id] ?? id;
-      if (result?.status === "ready" && result.analysis) {
-        return algorithmSectionHtml(label, result.analysis);
-      }
-      if (result?.status === "error") {
-        return `<section class="algo"><h2>${escapeHtml(label)}</h2><p class="empty">Tagging failed: ${escapeHtml(result.error ?? "unknown error")}</p></section>`;
-      }
-      return "";
-    })
-    .join("");
-
-  const generated = new Date().toLocaleString();
-
-  return `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Atlantis tag analysis report</title>
-<style>
-  @page { margin: 1.5cm; }
-  body { font-family: Georgia, serif; color: #201d19; background: #faf8f3; }
-  h1 { font-size: 1.6rem; }
-  h2 { font-size: 1.15rem; border-top: 2px solid #201d19; padding-top: 0.75rem; margin-top: 2rem;
-       break-before: auto; break-after: avoid; }
-  h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; color: #5a544c;
-       margin-top: 1.25rem; margin-bottom: 0.4rem; break-after: avoid; }
-  .meta { color: #5a544c; font-size: 0.85rem; }
-  .cover-image { max-width: 100%; max-height: 24rem; display: block; margin: 1rem 0;
-                 border: 1px solid #ddd4c4; }
-  table.tags { border-collapse: collapse; width: 100%; font-size: 0.85rem; break-inside: avoid; }
-  table.tags th, table.tags td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #ddd4c4; }
-  table.tags tr.muted { color: #8c8579; }
-  .label { font-weight: 700; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.06em;
-           color: #8c8579; margin-right: 0.4rem; }
-  .mono { font-family: ui-monospace, Menlo, monospace; }
-  .empty { color: #8c8579; font-size: 0.85rem; font-style: italic; }
-  .judge-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.5rem; }
-  .judge-list li { background: #f2e3dd; padding: 0.5rem 0.75rem; border-left: 3px solid #7a3226; font-size: 0.85rem;
-                   break-inside: avoid; }
-  .flagged { font-weight: 700; }
-  .reason { color: #5a544c; margin-top: 0.2rem; }
-  .caption, .prompt { font-size: 0.85rem; margin-top: 0.75rem; }
-</style>
-</head>
-<body>
-  <h1>Atlantis &mdash; tag analysis report</h1>
-  <p class="meta">Generated ${escapeHtml(generated)}${genre ? ` &middot; genre: ${escapeHtml(genre)}` : ""}</p>
-  ${imageSrc ? `<img class="cover-image" src="${escapeHtml(imageSrc)}" alt="">` : ""}
-  ${sections}
-</body>
-</html>`;
-}
-
-// downloadBlob, not window.print()/a native dialog -- an earlier version of
-// this feature drove the browser's print-to-PDF dialog instead, which
-// crashed inside a Cursor-embedded webview. A downloaded .html file the
-// user opens in their own browser sidesteps that entirely, and can still be
-// printed-to-PDF from there if wanted.
-function downloadReportHtml(html: string) {
-  const blob = new Blob([html], { type: "text/html" });
-  downloadBlob(blob, `atlantis-tag-report-${new Date().toISOString().slice(0, 10)}.html`);
-}
-
 const PLOT_WIDTH = 520;
 const PLOT_HEIGHT = 300;
 const PLOT_MARGIN = 30;
@@ -431,8 +212,8 @@ function estimateTextWidth(text: string) {
   return text.length * 5.4 + 16;
 }
 
-// A 2D scatter of the top-20 tag candidates, color-coded by facet, with the
-// image's projected position marked separately, on its own dark panel.
+// A 2D scatter of the final tags, color-coded by facet, with the image's
+// projected position marked separately, on its own dark panel.
 // SigLIP/CLIP-family models' image/text "modality gap" means the image often
 // lands well outside the tag cluster (see embedding_projection's docstring in
 // backend/embedding_tagger.py) -- rather than stretch the shared scale to fit
@@ -523,7 +304,7 @@ function EmbeddingPlot({
       <svg
         viewBox={`0 0 ${PLOT_WIDTH} ${PLOT_HEIGHT}`}
         role="img"
-        aria-label={`2D projection of the top 20 tag candidates and the image in ${algorithmLabel}'s embedding space. Hover a point for its tag and facet.`}
+        aria-label={`2D projection of the final tags and the image in ${algorithmLabel}'s embedding space. Hover a point for its tag and facet.`}
       >
         {points.map((p) => {
           const isFinal = finalTags.has(p.tag);
@@ -604,51 +385,25 @@ function EmbeddingPlot({
         ))}
       </div>
 
-      <p className="note">
-        {algorithmLabel} embeds the image and each candidate word into a{" "}
-        {embedding.source_dimensions}-dimensional vector; PCA projects those
-        vectors onto the two directions of greatest variance so they can be
-        plotted here in 2D. The selected tags are bright, the other
-        candidates dimmed -- hover or tab to a point for its tag and facet.
-        {imageOffscreen &&
-          " The image's true position sits well outside this tag cluster -- pinned here to the edge nearest it."}
-      </p>
-      <p className="note">
-        Circle size/brightness marks selection, not rank -- for a word&rsquo;s
-        actual match strength, read its score above. Distance between two{" "}
-        <em>tag</em> points is the meaningful reading here: tags sitting close
-        together really are similar to each other in {algorithmLabel}&rsquo;s
-        full space. Distance from a tag to the image marker isn&rsquo;t
-        reliable the same way -- SigLIP/CLIP-family models&rsquo; image and
-        text embeddings occupy separate regions of the space almost
-        regardless of how well a word actually fits (a &ldquo;modality
-        gap&rdquo;), so the image&rsquo;s position here says little about any
-        one tag&rsquo;s fit.
-      </p>
+      <p className="note">Lorem ipsum</p>
     </div>
   );
 }
 
-// One tag pill -- used both for the final tag row (bright) and the top-20
-// candidates row (muted, with the selected ones highlighted), which used to
-// hand-build the same tag-group/tag-facet/tag/tag-score markup separately.
+// One tag pill for the final tag row.
 function TagChip({
   tag,
   facet,
   score,
-  muted,
-  selected,
 }: {
   tag: string;
   facet: string;
   score: number;
-  muted?: boolean;
-  selected?: boolean;
 }) {
   return (
-    <span className={`tag-group${selected ? " is-selected" : ""}`}>
+    <span className="tag-group">
       <span className="tag-facet">{facet}</span>
-      <span className={`tag${muted ? " tag-muted" : ""}`}>
+      <span className="tag">
         {tag}
         <span className="tag-score">{formatScore(score)}</span>
       </span>
@@ -688,68 +443,19 @@ function JudgeReviewSection({
   );
 }
 
-// The tag row, judge review, top-20 candidates and prompt line -- shared by
-// every algorithm row in the current run, so SigLIP mode and Suite mode
-// never drift apart in how they present a tag set. Its one call site
-// (RunRow) only renders this once tagging has actually succeeded, so every
-// prop here is guaranteed to exist by then -- no defaulting needed.
-function TagBreakdown({
-  tagging,
-  prompt,
-  algorithm,
-  algorithmLabel,
-}: {
-  tagging: Tagging;
-  prompt: string;
-  algorithm: string;
-  algorithmLabel: string;
-}) {
-  // Only SigLIP has a trained calibration head turning cosine similarity into a
-  // 0-1 probability (see backend/embedding_tagger.py's module docstring) -- every
-  // other algorithm here scores with raw cosine similarity on its own scale, so
-  // the score-meaning copy has to say something different for it.
-  const calibrated = algorithm === "siglip";
-
+// The tag row and judge review -- shared by every algorithm row in the
+// current run, so SigLIP mode and Suite mode never drift apart in how they
+// present a tag set. Its one call site (RunRow) only renders this once
+// tagging has actually succeeded, so every prop here is guaranteed to exist
+// by then -- no defaulting needed.
+function TagBreakdown({ tagging }: { tagging: Tagging }) {
   return (
     <>
       {tagging.final.length > 0 && (
-        <>
-          <div className="tags">
-            {tagging.final.map(({ tag, facet, score }) => (
-              <TagChip key={tag} tag={tag} facet={facet} score={score} />
-            ))}
-          </div>
-          <p className="note">
-            {calibrated ? (
-              <>
-                The number beside each tag is {algorithmLabel}&rsquo;s match
-                probability for that word against this image (0–1) -- not a
-                rank. Scores across the whole vocabulary sit close to zero, so
-                small differences still mean one word fit noticeably better
-                than another.
-              </>
-            ) : (
-              <>
-                The number beside each tag is raw cosine similarity between
-                the image and that word in {algorithmLabel}&rsquo;s own
-                embedding space -- not a rank, and not on the same 0–1 scale
-                as SigLIP&rsquo;s calibrated probability, so it isn&rsquo;t
-                meaningful to compare these numbers across algorithms.
-              </>
-            )}
-          </p>
-        </>
-      )}
-
-      {tagging.caption && (
-        <div className="caption-block">
-          <span className="meta-label">caption</span>
-          <p className="caption-text">&ldquo;{tagging.caption}&rdquo;</p>
-          <p className="note">
-            {algorithmLabel}&rsquo;s captioning head describing the image in
-            free text -- shown for comparison only, never sent to Suno or
-            used to pick tags.
-          </p>
+        <div className="tags">
+          {tagging.final.map(({ tag, facet, score }) => (
+            <TagChip key={tag} tag={tag} facet={facet} score={score} />
+          ))}
         </div>
       )}
 
@@ -772,31 +478,6 @@ function TagBreakdown({
         }
         rows={contradictionRows(tagging.contradictions)}
       />
-
-      {tagging.top20.length > 0 && (
-        <div className="top20">
-          <span className="meta-label">top 20 candidates</span>
-          <div className="tags tags-muted">
-            {tagging.top20.map(({ tag, facet, score }) => (
-              <TagChip
-                key={tag}
-                tag={tag}
-                facet={facet}
-                score={score}
-                muted
-                selected={tagging.final.some((f) => f.tag === tag)}
-              />
-            ))}
-          </div>
-        </div>
-      )}
-
-      {prompt && (
-        <div className="meta prompt-line">
-          <span className="meta-label">prompt sent to Suno: </span>
-          <span className="mono">{prompt}</span>
-        </div>
-      )}
     </>
   );
 }
@@ -810,16 +491,20 @@ function RunRow({
   previewUrl,
   result,
   onGenerate,
+  showEmbedding,
+  reversed,
 }: {
   algorithmLabel: string;
   previewUrl: string | null;
   result: RunResult;
   onGenerate: () => void;
+  showEmbedding: boolean;
+  reversed: boolean;
 }) {
   const embedding = result.analysis?.tagging.embedding;
 
   return (
-    <div className="run-row">
+    <div className={`run-row${reversed ? " run-row-reversed" : ""}`}>
       <div className="run-row-media">
         {previewUrl && (
           // eslint-disable-next-line @next/next/no-img-element -- local blob: URL, not a remote image
@@ -828,10 +513,11 @@ function RunRow({
 
         {/* Fills the space below the image rather than leaving it blank --
             same data the old inline embedding section showed, just relocated
-            so the image column isn't dead space once tagging finishes. */}
-        {embedding && embedding.points.length > 0 && result.analysis && (
+            so the image column isn't dead space once tagging finishes. Suite
+            mode only -- SigLIP-only's single row skips it entirely. */}
+        {showEmbedding && embedding && embedding.points.length > 0 && result.analysis && (
           <div className="embedding-section">
-            <span className="meta-label">embedding space (illustrative)</span>
+            <span className="meta-label">{algorithmLabel} Joint Embedding Space</span>
             <EmbeddingPlot
               embedding={embedding}
               finalTags={new Set(result.analysis.tagging.final.map((f) => f.tag))}
@@ -843,7 +529,7 @@ function RunRow({
 
       <div className="run-row-body">
         <div className="run-row-head">
-          <span className="run-name">{algorithmLabel}: Tag Analysis</span>
+          <span className="run-name">{algorithmLabel} Extracted Tags</span>
         </div>
 
         {result.status === "loading" && (
@@ -856,12 +542,7 @@ function RunRow({
 
         {result.status === "ready" && result.analysis && (
           <>
-            <TagBreakdown
-              tagging={result.analysis.tagging}
-              prompt={result.analysis.prompt}
-              algorithm={result.analysis.algorithm}
-              algorithmLabel={algorithmLabel}
-            />
+            <TagBreakdown tagging={result.analysis.tagging} />
 
             {!result.generated && (
               <div className="actions">
@@ -895,15 +576,6 @@ function RunRow({
                   </span>
                 </div>
                 <audio controls src={fileUrl(track.audioFile)} />
-                <div className="actions">
-                  <button
-                    type="button"
-                    onClick={() => downloadTrack(track)}
-                    className="btn-sm"
-                  >
-                    ⬇ Download
-                  </button>
-                </div>
               </div>
             ))}
           </>
@@ -929,7 +601,7 @@ export default function Home() {
   // before a run starts -- the toggle disables once one is active, same as
   // the genre knob, since it can't retroactively affect tagging that
   // already happened.
-  const [judgesEnabled, setJudgesEnabled] = useState(true);
+  const [judgesEnabled, setJudgesEnabled] = useState(false);
 
   const [algorithms, setAlgorithms] = useState<AlgorithmInfo[]>([]);
   const algorithmLabels = useMemo(
@@ -960,14 +632,24 @@ export default function Home() {
     Object.values(results).some((r) => r.status === "loading" || r.generating);
 
   // Suite-mode-only: algorithms that finished tagging but haven't had a song
-  // generated (or started generating) yet -- what "Generate all" below would
-  // actually kick off if clicked right now. Recomputed on every render
-  // rather than tracked separately, so it stays correct as rows finish
-  // tagging or generating one at a time.
-  const pendingGenerateAlgorithms = runAlgorithms.filter((id) => {
-    const result = results[id];
-    return result?.status === "ready" && result.analysis && !result.generated && !result.generating;
-  });
+  // generated (or started generating) yet -- feeds the SigLIP-only auto-chain
+  // effect below. Memoized on `results` so its identity only changes when
+  // membership actually does, not on every render -- the effect below depends
+  // on it directly.
+  const pendingGenerateAlgorithms = useMemo(
+    () =>
+      Object.keys(results).filter((id) => {
+        const result = results[id];
+        return (
+          result?.status === "ready" &&
+          result.analysis &&
+          !result.generated &&
+          !result.generating &&
+          !result.generateError
+        );
+      }),
+    [results],
+  );
 
   // Deleting is irreversible and nothing is backed up, so the button has to be
   // clicked twice. This holds whether it is currently armed.
@@ -1142,17 +824,12 @@ export default function Home() {
 
     // Unlike /tag, /generate never re-tags the image -- it only needs the
     // original filename (for the audio naming convention), not the bytes,
-    // so there's no reason to re-upload the whole file here. `tagging` still
-    // carries `image_data_url` (added for the downloadable report), which
-    // /generate would otherwise just echo back unread -- stripped here so a
-    // multi-MB base64 image doesn't ride along on every generate call.
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- destructured only to exclude it from the rest
-    const { image_data_url, ...taggingForGenerate } = result.analysis.tagging;
+    // so there's no reason to re-upload the whole file here.
     const body = new FormData();
     body.append("image_filename", file ? file.name : (selectedSample ?? ""));
     body.append("tags", JSON.stringify(result.analysis.tags));
     body.append("tag_scores", JSON.stringify(result.analysis.tag_scores));
-    body.append("tagging", JSON.stringify(taggingForGenerate));
+    body.append("tagging", JSON.stringify(result.analysis.tagging));
     body.append("prompt", result.analysis.prompt);
 
     const params = new URLSearchParams({ algorithm: result.analysis.algorithm });
@@ -1180,90 +857,28 @@ export default function Home() {
     }
   }
 
-  // Suite mode only: fires handleGenerate for every algorithm that's ready
-  // and hasn't been generated (or isn't already generating) yet -- same
-  // independent-parallel-calls pattern as startRun, so one algorithm's
-  // apiframe error doesn't hold up the rest. Costs real apiframe credits
-  // (11 per song, so 5 algorithms is 55) -- there's no confirmation step
-  // here, matching the per-row "Generate song" button, which also commits
-  // credits on a single click.
-  function handleGenerateAll() {
-    pendingGenerateAlgorithms.forEach((algorithm) => {
-      handleGenerate(algorithm);
-    });
-  }
-
-  // Suite-mode-only, same gating spirit as "Generate all": available once
-  // every algorithm has finished tagging (loading or not is what's checked,
-  // not `busy`, since an in-progress song render shouldn't block a report
-  // about the tags).
-  const stillTagging = runAlgorithms.some((id) => results[id]?.status === "loading");
-
-  function handleDownloadReport() {
-    const html = buildReportHtml({ results, runAlgorithms, algorithmLabels, genre });
-    downloadReportHtml(html);
-  }
+  // SigLIP-only ("Generate Song") auto-chains straight from tagging into
+  // generation -- no manual second click, unlike Suite mode's per-row
+  // "Generate song" button. `pendingGenerateAlgorithms` already excludes
+  // anything generating/generated/not-ready, so this only ever fires once
+  // per run: reading `results` (not calling handleGenerate synchronously
+  // inside startRun's tagging `.then()`) avoids acting on a stale closure
+  // of `results` from before the tagging state actually committed.
+  useEffect(() => {
+    if (runAlgorithms.length !== 1) return;
+    if (pendingGenerateAlgorithms.length !== 1) return;
+    handleGenerate(pendingGenerateAlgorithms[0]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- handleGenerate is redefined every render; pendingGenerateAlgorithms already tracks everything this effect needs to re-fire on
+  }, [pendingGenerateAlgorithms, runAlgorithms.length]);
 
   return (
     <main className="page">
       <header className="hero">
-        <h1 className="title">Atlantis</h1>
-
-        <div className="genre-card">
-          <h2 className="section-title">
-            Genre <span className="meta-label">(optional, just for fun)</span>
-          </h2>
-
-          <section className="genre">
-            <SpinKnob
-              options={genres}
-              value={genre}
-              onChange={setQuery}
-              label="Genre"
-              disabled={busy || runActive}
-            />
-
-            <div className="genre-fields">
-              <label htmlFor="genre-search" className="genre-label">
-                Genre
-              </label>
-
-              <input
-                id="genre-search"
-                list="genre-options"
-                value={query}
-                disabled={busy || runActive}
-                placeholder="spin, search or roll"
-                onChange={(event) => setQuery(event.target.value)}
-                className="genre-input"
-              />
-              <datalist id="genre-options">
-                {genres.map((name) => (
-                  <option key={name} value={name} />
-                ))}
-              </datalist>
-
-              <div className="row">
-                <button
-                  type="button"
-                  onClick={rollRandomGenre}
-                  disabled={busy || runActive || genres.length === 0}
-                  className="btn-sm"
-                >
-                  🎲 Random
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setQuery("")}
-                  disabled={busy || runActive || !query}
-                  className="btn-sm"
-                >
-                  Clear
-                </button>
-              </div>
-            </div>
-          </section>
-        </div>
+        <h1 className="title">Ideagream Studio</h1>
+        <p className="subtitle">
+          A better way to compose mood-accurate songs from images using joint
+          embedding spaces
+        </p>
       </header>
 
       <div className="info-card">
@@ -1330,16 +945,16 @@ export default function Home() {
           <button
             onClick={() => startRun(["siglip"])}
             disabled={!hasImage || runActive || busy}
-            className="btn-primary btn-lg"
+            className="btn-primary btn-lg btn-run-primary"
           >
-            Use SigLIP
+            Generate Song
           </button>
           <button
             onClick={() => startRun(algorithms.map((a) => a.id))}
             disabled={!hasImage || runActive || busy || algorithms.length === 0}
-            className="btn-primary btn-lg"
+            className="btn-primary btn-lg btn-run-secondary"
           >
-            5 Algorithm Suite
+            {algorithms.length} Algorithm Suite
           </button>
 
           <label className="judges-toggle">
@@ -1360,30 +975,7 @@ export default function Home() {
 
       {runActive && (
         <div className="runs">
-          {runAlgorithms.length > 1 && (
-            <div className="actions">
-              <button
-                type="button"
-                onClick={handleGenerateAll}
-                disabled={pendingGenerateAlgorithms.length === 0}
-                className="btn-primary"
-              >
-                {pendingGenerateAlgorithms.length > 0
-                  ? `Generate all ${pendingGenerateAlgorithms.length} in parallel (${pendingGenerateAlgorithms.length * 11} credits)`
-                  : "Generate all in parallel"}
-              </button>
-              <button
-                type="button"
-                onClick={handleDownloadReport}
-                disabled={stillTagging}
-                className="btn-sm"
-              >
-                Download tag analysis (.html)
-              </button>
-            </div>
-          )}
-
-          {runAlgorithms.map((algorithm) => (
+          {runAlgorithms.map((algorithm, index) => (
             <RunRow
               key={algorithm}
               algorithmLabel={algorithmLabels[algorithm] ?? algorithm}
@@ -1392,6 +984,8 @@ export default function Home() {
                 results[algorithm] ?? { status: "loading" as const }
               }
               onGenerate={() => handleGenerate(algorithm)}
+              showEmbedding={runAlgorithms.length > 1}
+              reversed={index % 2 === 1}
             />
           ))}
         </div>
@@ -1405,10 +999,62 @@ export default function Home() {
         >
           {armed ? "Clear this run? Click again" : "Clear"}
         </button>
-        <p className="note">
-          Deletes the current image and any generated MP3s. Nothing is
-          backed up. Required before picking a new image.
-        </p>
+      </div>
+
+      <div className="genre-card">
+        <h2 className="section-title">
+          Genre Knob <span className="meta-label">Optional</span>
+        </h2>
+
+        <section className="genre">
+          <SpinKnob
+            options={genres}
+            value={genre}
+            onChange={setQuery}
+            label="Genre"
+            disabled={busy || runActive}
+          />
+
+          <div className="genre-fields">
+            <label htmlFor="genre-search" className="genre-label">
+              Genre
+            </label>
+
+            <input
+              id="genre-search"
+              list="genre-options"
+              value={query}
+              disabled={busy || runActive}
+              placeholder="spin, search or roll"
+              onChange={(event) => setQuery(event.target.value)}
+              className="genre-input"
+            />
+            <datalist id="genre-options">
+              {genres.map((name) => (
+                <option key={name} value={name} />
+              ))}
+            </datalist>
+
+            <div className="row">
+              <button
+                type="button"
+                onClick={rollRandomGenre}
+                disabled={busy || runActive || genres.length === 0}
+                className="btn-sm"
+              >
+                🎲 Random
+              </button>
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                disabled={busy || runActive || !query}
+                className="btn-sm"
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+        </section>
       </div>
     </main>
   );

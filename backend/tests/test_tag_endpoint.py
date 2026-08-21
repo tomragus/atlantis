@@ -72,8 +72,6 @@ def test_tag_rejects_both_image_and_sample_image(client):
 
 
 def test_tag_sample_image_reads_bytes_from_disk(client, monkeypatch, fake_siglip_state):
-    import base64
-
     import main
 
     fake_vector = fake_siglip_state.text_vectors["mood"][0].unsqueeze(0)
@@ -84,13 +82,6 @@ def test_tag_sample_image_reads_bytes_from_disk(client, monkeypatch, fake_siglip
 
     resp = client.post("/tag", params={"sample_image": real_name})
     assert resp.status_code == 200
-    body = resp.json()
-    # Round-trips to the exact bytes on disk, so the frontend's downloadable
-    # report can embed this image without a second (CORS-prone) fetch.
-    expected_bytes = (main.TEST_IMAGES_DIR / real_name).read_bytes()
-    data_url = body["tagging"]["image_data_url"]
-    assert data_url.startswith("data:image/png;base64,")
-    assert base64.b64decode(data_url.split(",", 1)[1]) == expected_bytes
 
 
 def test_tag_rejects_unknown_genre(client, monkeypatch, fake_siglip_state):
@@ -144,9 +135,6 @@ def test_tag_happy_path(client, monkeypatch, fake_siglip_state):
     assert len(body["tagging"]["final"]) == expected_tag_count
     assert body["tagging"]["embedding"]["model"] == "google/siglip2-base-patch16-224"
     assert body["tagging"]["judges_enabled"] is True
-    assert body["tagging"]["image_data_url"].startswith("data:image/png;base64,")
-    # No genre -> Suno prompt is just the tags, comma-joined.
-    assert "caption" not in body["tagging"]
 
 
 def test_tag_without_genre_omits_it_from_prompt(client, monkeypatch, fake_siglip_state):
@@ -329,26 +317,3 @@ def test_tag_judges_true_by_default(client, monkeypatch, fake_siglip_state):
     resp = client.post("/tag", files={"image": ("x.png", png_bytes(), "image/png")})
     assert resp.status_code == 200
     assert calls == ["judge_image", "judge_contradictions"]
-
-
-def test_tag_coca_includes_caption_display_only(client, monkeypatch):
-    import embedding_tagger
-    from conftest import make_fake_algorithm_state
-
-    state = make_fake_algorithm_state()
-    monkeypatch.setitem(embedding_tagger._state, "coca", state)
-
-    fake_vector = state.text_vectors["mood"][0].unsqueeze(0)
-    monkeypatch.setattr(embedding_tagger, "embed_image", lambda image_bytes, algorithm="coca": fake_vector)
-    monkeypatch.setattr(embedding_tagger, "generate_caption", lambda image_bytes: "a quiet street at dusk")
-    _no_flags(monkeypatch)
-
-    resp = client.post(
-        "/tag",
-        files={"image": ("x.png", png_bytes(), "image/png")},
-        params={"algorithm": "coca"},
-    )
-    body = resp.json()
-    assert body["tagging"]["caption"] == "a quiet street at dusk"
-    # Display-only: never folded into the prompt.
-    assert "a quiet street at dusk" not in body["prompt"]

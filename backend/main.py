@@ -1,4 +1,3 @@
-import base64
 import json
 import os
 import time
@@ -21,7 +20,7 @@ from genres import GENRES, prompt_term, validate_genre
 # so os.environ can see them below.
 load_dotenv()
 
-app = FastAPI(title="Image to Song")
+app = FastAPI(title="Ideagream Studio")
 
 # Pillow opens more than these, but the frontend's file picker and the tagger are
 # only exercised against the common web formats, so the rest are turned away.
@@ -296,49 +295,14 @@ def list_test_images() -> list[str]:
 
 
 def build_tagging_summary(
-    ranked: dict,
     facet_of: dict,
     verdicts: list[dict],
     contradictions: list[dict],
     final_tags: list[str],
     final_scores: dict,
 ) -> dict:
-    """Assembles everything the frontend needs to show how the tags were picked.
-
-    `ranked` already holds every candidate word per facet (see
-    `siglip_tags_by_facet`), so this is pure bookkeeping: no re-scoring.
-    `facet_of` is passed in rather than recomputed here since the caller
-    (`tag()` below) already builds it from the same `ranked` for the
-    contradiction judge -- no reason to derive it from scratch twice.
-    """
-    # The final tags are picked per-facet by quota (see select_tags), not by a flat
-    # global top-N, so a naive top-20-by-score over the whole vocabulary can miss
-    # some of them entirely -- a facet-dominant word from another facet would
-    # outscore a final tag from an under-represented one. Guarantee every final tag
-    # appears, then fill the rest of the 20 slots with the next best-scoring
-    # candidates that aren't already final, so "top 20" always means "the tags that
-    # were actually picked, plus the next-best runners-up" -- and so the embedding
-    # plot below (which projects exactly these 20 points) never shows a final tag
-    # dimmed as unselected.
-    final_tag_set = set(final_tags)
-    all_candidates = [
-        {"tag": word, "facet": facet, "score": score}
-        for facet, candidates in ranked.items()
-        for word, score in candidates
-    ]
-    runners_up = sorted(
-        (entry for entry in all_candidates if entry["tag"] not in final_tag_set),
-        key=lambda entry: entry["score"],
-        reverse=True,
-    )[: max(20 - len(final_tag_set), 0)]
-    top20 = sorted(
-        [entry for entry in all_candidates if entry["tag"] in final_tag_set] + runners_up,
-        key=lambda entry: entry["score"],
-        reverse=True,
-    )
-
+    """Assembles everything the frontend needs to show how the tags were picked."""
     return {
-        "top20": top20,
         "judge": verdicts,
         "contradictions": contradictions,
         "final": [
@@ -388,7 +352,6 @@ def tag(
         drop_flagged_tags,
         word_to_facet,
         embedding_projection,
-        generate_caption,
     )
     from judge import judge_image
     from contradiction_judge import judge_contradictions
@@ -405,10 +368,8 @@ def tag(
         if sample_image not in known_sample_images():
             raise HTTPException(status_code=400, detail=f"Unknown sample image: {sample_image}")
         image_bytes = (TEST_IMAGES_DIR / sample_image).read_bytes()
-        image_content_type = "image/png"
     elif image is not None:
         image_bytes = read_image(image)
-        image_content_type = image.content_type
     else:
         raise HTTPException(status_code=400, detail="Provide either an uploaded image or a sample_image filename.")
     # Computed once and reused below for the embedding-space plot -- tags_by_facet
@@ -454,7 +415,6 @@ def tag(
             print(f"contradiction judge call failed, using tags as-is: {exc}")
 
     tagging = build_tagging_summary(
-        ranked,
         facet_of,
         verdicts,
         contradictions,
@@ -465,27 +425,12 @@ def tag(
     # "judges were skipped" -- both look identical as empty `judge`/
     # `contradictions` lists otherwise.
     tagging["judges_enabled"] = judges
-    # The image as a data URI, so the frontend's downloadable tag-analysis
-    # report can embed it directly without a second fetch -- an uploaded
-    # image the frontend already has as a File, and a sample_image URL that
-    # (per the docstring above) deliberately never gets fetched client-side.
-    # Duplicating these bytes across all 5 responses in Suite mode is wasteful
-    # bandwidth, but each request tags one image locally, not at any scale
-    # where that matters.
-    tagging["image_data_url"] = (
-        f"data:{image_content_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
-    )
     tagging["embedding"] = embedding_projection(
         image_bytes,
-        [(point["tag"], point["facet"]) for point in tagging["top20"]],
+        [(point["tag"], point["facet"]) for point in tagging["final"]],
         algorithm=algorithm,
         image_vector=image_vector,
     )
-
-    # CoCa-only: a free-text caption, display-only -- never fed into the tags or
-    # the Suno prompt below.
-    if algorithm == "coca":
-        tagging["caption"] = generate_caption(image_bytes)
 
     # The genre leads the prompt rather than using Suno's `style` parameter,
     # which is its documented home but made no audible difference in testing.
