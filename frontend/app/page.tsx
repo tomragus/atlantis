@@ -1,15 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 
 import SpinKnob from "./SpinKnob";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 
 type Track = {
-  title: string;
-  duration: number;
-  audioUrl: string;
   audioFile: string;
 };
 
@@ -75,6 +72,10 @@ type Tagging = {
   // list looks the same whether the judges ran and flagged nothing, or
   // never ran at all, so this is what tells those two cases apart.
   judges_enabled: boolean;
+  // Same idea as judges_enabled, for the "Embedding space visual" toggle --
+  // `embedding`'s mere absence already implies this was false, but an
+  // explicit field means nothing has to know that implicit contract.
+  embedding_enabled: boolean;
   embedding?: Embedding;
 };
 
@@ -105,7 +106,7 @@ const FACET_COLORS: Record<string, string> = {
 };
 
 // What `POST /tag` returns: the tagging half of the pipeline only, no Suno
-// call yet. Held in state until the user commits with "Generate song", at
+// call yet. Held in state until the user commits with "Generate Songs", at
 // which point it's sent straight back to `POST /generate` so the judge
 // never has to run a second time for the same image.
 type Analysis = {
@@ -123,10 +124,8 @@ type GeneratedSong = {
   tracks: Track[];
 };
 
-// One algorithm's slot within the current run. SigLIP mode has exactly one
-// of these; Suite mode has one per algorithm, tracked independently so a
-// single algorithm failing (a model that errors, a judge call that times
-// out) doesn't blank the other rows.
+// The current run's tagging/generation state, for whichever algorithm the
+// dropdown had selected when "Extract Tags" was clicked.
 type RunResult = {
   status: "loading" | "ready" | "error";
   analysis?: Analysis;
@@ -443,11 +442,9 @@ function JudgeReviewSection({
   );
 }
 
-// The tag row and judge review -- shared by every algorithm row in the
-// current run, so SigLIP mode and Suite mode never drift apart in how they
-// present a tag set. Its one call site (RunRow) only renders this once
-// tagging has actually succeeded, so every prop here is guaranteed to exist
-// by then -- no defaulting needed.
+// The tag row and judge review. Its one call site (RunRow) only renders
+// this once tagging has actually succeeded, so every prop here is
+// guaranteed to exist by then -- no defaulting needed.
 function TagBreakdown({ tagging }: { tagging: Tagging }) {
   return (
     <>
@@ -482,29 +479,23 @@ function TagBreakdown({ tagging }: { tagging: Tagging }) {
   );
 }
 
-// One row of the run: the image on the left, that algorithm's tag breakdown
-// on the right, and (once tagging succeeded) its own independent Generate
-// song action and result. Used for both SigLIP mode (one row) and Suite
-// mode (five rows, back to back, so tag sets are easy to compare).
+// The run's image on the left, its tag breakdown on the right, and (once
+// tagging succeeded) its own Generate Songs action and result.
 function RunRow({
   algorithmLabel,
   previewUrl,
   result,
   onGenerate,
-  showEmbedding,
-  reversed,
 }: {
   algorithmLabel: string;
   previewUrl: string | null;
   result: RunResult;
   onGenerate: () => void;
-  showEmbedding: boolean;
-  reversed: boolean;
 }) {
   const embedding = result.analysis?.tagging.embedding;
 
   return (
-    <div className={`run-row${reversed ? " run-row-reversed" : ""}`}>
+    <div className="run-row">
       <div className="run-row-media">
         {previewUrl && (
           // eslint-disable-next-line @next/next/no-img-element -- local blob: URL, not a remote image
@@ -513,9 +504,11 @@ function RunRow({
 
         {/* Fills the space below the image rather than leaving it blank --
             same data the old inline embedding section showed, just relocated
-            so the image column isn't dead space once tagging finishes. Suite
-            mode only -- SigLIP-only's single row skips it entirely. */}
-        {showEmbedding && embedding && embedding.points.length > 0 && result.analysis && (
+            so the image column isn't dead space once tagging finishes. Only
+            present at all when the "Embedding space visual" toggle was on
+            for this run -- the backend omits `tagging.embedding` entirely
+            otherwise, so its mere presence here is the gate. */}
+        {embedding && embedding.points.length > 0 && result.analysis && (
           <div className="embedding-section">
             <span className="meta-label">{algorithmLabel} Joint Embedding Space</span>
             <EmbeddingPlot
@@ -551,14 +544,14 @@ function RunRow({
                   disabled={result.generating}
                   className="btn-primary"
                 >
-                  {result.generating ? "Composing…" : "Generate song"}
+                  {result.generating ? "Composing…" : "Generate Songs"}
                 </button>
               </div>
             )}
 
             {result.generating && (
               <p className="status-notice">
-                This takes about two minutes. Keep this tab open.
+                Generating... takes about 2 minutes.
               </p>
             )}
 
@@ -568,13 +561,7 @@ function RunRow({
 
             {result.generated?.tracks.map((track, index) => (
               <div key={track.audioFile} className="take">
-                <div className="take-title">
-                  Take {index + 1}
-                  <span className="take-name">
-                    {" — "}
-                    {track.title}
-                  </span>
-                </div>
+                <div className="take-title">Take {index + 1}</div>
                 <audio controls src={fileUrl(track.audioFile)} />
               </div>
             ))}
@@ -585,6 +572,206 @@ function RunRow({
   );
 }
 
+// The HF checkpoint string per algorithm id -- same ids/strings as
+// backend/embedding_tagger.py's HF_MODEL_IDS. Only the id needs hardcoding
+// here; the display label comes from the already-fetched `algorithms` prop
+// (GET /algorithms, i.e. backend/algorithms.py's ALGORITHM_INFO) rather than
+// a second hand-typed copy that could drift from it.
+const CHECKPOINT_IDS: Record<string, string> = {
+  siglip: "google/siglip2-base-patch16-224",
+  clip: "openai/clip-vit-base-patch32",
+  align: "kakaobrain/align-base",
+  metaclip: "facebook/metaclip-b32-400m",
+};
+
+// Plain background text -- no card, no border -- explaining the pipeline for
+// anyone curious enough to read past the app itself. Only prop is the
+// already-fetched algorithm list, for the checkpoint links' labels; memoized
+// since this ~170-line static subtree never needs to re-render on Home's
+// other state changes (a genre-search keystroke, a knob drag, a run status
+// update) once `algorithms` has settled after its one-time fetch.
+const AboutSection = memo(function AboutSection({
+  algorithms,
+}: {
+  algorithms: AlgorithmInfo[];
+}) {
+  return (
+    <section className="about">
+      <h2 className="about-heading">How it works</h2>
+
+      <p>
+        SigLIP2 (Sigmoid Loss for Language-Image Pre-Training 2) from Google
+        was trained on huge batches of image-caption pairs scraped from the
+        internet.
+      </p>
+
+      <p>
+        When you upload an image, the SigLIP2 embedding algorithm’s image
+        encoder splits the image up into a 14x14 grid of tiles, each of which
+        gets turned into a 768-dimensional vector, which is a rich numerical
+        fingerprint capturing color, texture, edges and more. These vectors
+        are initially independent (meaning, each one has no knowledge of the
+        others), but are then fed into 12 transformer layers in which each
+        vector gets iteratively updated based on context from the others.
+        After this process, the 196 tiles are fed into a single pooling
+        layer, which asks each tile “what do you know about this image?”,
+        and composes a single 768-dimensional vector summarizing the
+        responses.
+      </p>
+
+      <p>
+        Simultaneously, the same embedding process is happening on a curated
+        set of 261 descriptive vocabulary tags covering 8 distinct regions of
+        “feel”, including color, light, mood, valence, arousal, texture,
+        energy and style. Because SigLIP2 was trained on captions instead of
+        individual words, each tag gets wrapped into 4 short template
+        sentences:
+      </p>
+
+      <ul>
+        <li>“a photo that feels {"{tag}"}”</li>
+        <li>“a {"{tag}"} image”</li>
+        <li>“{"{tag}"} atmosphere”</li>
+        <li>“a picture with a {"{tag}"} quality”</li>
+      </ul>
+
+      <p>
+        Each set of these template phrases gets batched and fed into the text
+        encoder, after which they are stacked and averaged resulting in a
+        single 768-dimensional embedding vector per tag.
+      </p>
+
+      <p>
+        After encoding, the cosine similarity between the image vector and
+        each individual tag are calculated and fed into the sigmoid (hence
+        the name), which contains additional signal directly from SigLIP2’s
+        pre-training to get a final score. If you showed the image to the
+        model and asked “does the phrase ‘a photo that feels {"{tag}"}’
+        genuinely describe this image, yes or no?”, then the final score
+        would be how confident the model is that the answer is yes.
+      </p>
+
+      <p>
+        Final scores for tags are ranked and categorized by their distinct
+        region of “feel” (referred to in the code as “facet”). The top few
+        tags per facet (specifically: 2 for “color”, 1 for “light”, 3 for
+        “mood”, 1 for “valence”, 1 for “arousal”, 2 for “texture”, 1 for
+        “energy”, and 1 for “style”) are use to compose a prompt for the
+        Suno v5.5 Model, which is simply the list of tags in order from
+        highest to lowest score. That prompt is then fed to Suno to produce
+        2 highly mood-accurate songs for that image.
+      </p>
+
+      <p>
+        Through testing across a diverse image corpus, I have found this
+        system capable of accurately capturing a wide range of unique moods
+        and aesthetics from pleasant to whimsical to punk. It is really fun
+        to play with. Please try your own images and see what comes up!
+      </p>
+
+      <h3 className="about-heading">Optional LLM-Evaluation</h3>
+
+      <p>
+        The default system does not use language models anywhere in the tag
+        extraction process, which can sometimes lead to slightly unusual
+        tags ranking high for certain images. If you’d like, you can turn on
+        LLM-judges for a run for slightly more refined tag lists.
+      </p>
+
+      <p>
+        LLM-judge #1 is a vision model that views the image, then each tag,
+        and decides “whether it captures the mood or feeling the image
+        evokes - not whether it’s a literal, physically accurate
+        description” (taken directly from the system prompt). If not, the
+        tag gets flagged and then dropped from the prompt.
+      </p>
+
+      <p>
+        LLM-judge #2 is a text model that scans the tag list for any seeming
+        contradictions between tags across different facets (ex: “joyful”
+        from valence and “haunting” from mood). If it identifies a
+        contradictory pair, it then checks whether each tag’s feeling is
+        already covered by some other tag elsewhere in the list. Whichever
+        of the two tags has coverage gets dropped, since it is less
+        descriptive in the final Suno prompt. While this is somewhat
+        uncommon, there were instances in my testing of the system that
+        justified the creation of this judge.
+      </p>
+
+      <p>
+        These LLM-judges sort of “hone-in” the sometimes unpredictability of
+        the tags from the embedding model and thus the unpredictability of
+        the generated tracks. However, you’ll notice I have the LLM-judges
+        set to off by default: it sometimes feels like there is some magic
+        contained within these otherwise seemingly unfitting tags, which
+        shine through in the audio. If you play around with this enough,
+        you’ll know exactly what I mean!
+      </p>
+
+      <h3 className="about-heading">Other embedding algorithms</h3>
+
+      <p>
+        While this project was optimized for and built around the SigLIP2
+        algorithm, I also wanted to explore other embedding algorithms to
+        see how they compared: specifically, CLIP (SigLIP’s predecessor and
+        the OG joint embedding algorithm), ALIGN from Google (adaptation of
+        CLIP that uses EfficientNet for the image encoder and BERT for the
+        text encoder), and MetaCLIP from Meta (adaptation of CLIP that
+        favors more rare, specific concepts).
+      </p>
+
+      <p>
+        From my testing, CLIP and MetaCLIP felt like less refined versions
+        of SigLIP, producing tracks that sort of had the right idea but
+        ultimately tended to sound somewhat generic. ALIGN would
+        occasionally knock it out of the park, but I found it to be
+        unreliable and inconsistent. I should stress again that this project
+        was built around SigLIP2, so it’s very likely that a system like
+        this could work well for any of these algorithms if optimized
+        properly.
+      </p>
+
+      <p>Specific checkpoints (all loaded through HuggingFace transformers.AutoModel):</p>
+
+      <ul>
+        {algorithms.map(({ id, label }) => {
+          const checkpointId = CHECKPOINT_IDS[id];
+          return (
+            <li key={id}>
+              {label}:{" "}
+              <a href={`https://huggingface.co/${checkpointId}`} target="_blank" rel="noreferrer">
+                {checkpointId}
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+
+      <h3 className="about-heading">Genre Knob</h3>
+
+      <p>
+        You may have noticed the “Genre Knob”. This is a fun addition that
+        appends a genre tag to the start of a tag list to essentially force
+        the generated song to conform to a particular genre. You can select
+        from one of 17 genres: rock, psychedelic rock, prog rock, math rock,
+        metal, heavy metal, thrash metal, dream pop, synth-pop, idm, house,
+        techno, trance, jazz, jazz fusion, orchestral, and reggae (this
+        selection of genres is not comprehensive by any means, but from my
+        testing these were the genres that Suno v5.5 was most consistently
+        responsive to).
+      </p>
+
+      <p>
+        The genre tag tends to overpower the nuances that the embedding
+        algorithm captures, so I’ve positioned this as an extra feature not
+        central to the app. It is really fun to mess around with though, and
+        the tracks that get produced are quite good, which is a testament to
+        the quality of the Suno model.
+      </p>
+    </section>
+  );
+});
+
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -594,6 +781,17 @@ export default function Home() {
   // A half-typed word simply isn't a genre yet, which is what `genre` derives.
   const [query, setQuery] = useState("");
   const genre = genres.includes(query) ? query : "";
+  // Whether the Genre Knob modal is open. Picking a genre (spin, search,
+  // Random) never closes it on its own -- only an explicit dismissal
+  // (X, backdrop click, or Escape) does.
+  const [genreModalOpen, setGenreModalOpen] = useState(false);
+  // The modal panel itself, so the focus-trap effect below can find its
+  // focusable children and the backdrop's mousedown handler can tell "the
+  // drag started on the backdrop" apart from "it started inside the panel
+  // and was dragged out" (a plain onClick can't tell those apart, since a
+  // drag that ends outside the panel still fires its click on the backdrop).
+  const genreModalRef = useRef<HTMLDivElement>(null);
+  const genreBackdropMouseDownOnSelf = useRef(false);
 
   // Whether /tag runs its two Claude judge passes for the run about to
   // start. On by default; off skips both calls entirely on the backend
@@ -603,11 +801,21 @@ export default function Home() {
   // already happened.
   const [judgesEnabled, setJudgesEnabled] = useState(false);
 
+  // Whether /tag computes the joint embedding space plot for the run about
+  // to start. Off by default; off skips `embedding_projection` entirely on
+  // the backend (see main.py's `show_embedding` param), not just its
+  // display. Same disable-once-active convention as judgesEnabled.
+  const [embeddingEnabled, setEmbeddingEnabled] = useState(false);
+
   const [algorithms, setAlgorithms] = useState<AlgorithmInfo[]>([]);
   const algorithmLabels = useMemo(
     () => Object.fromEntries(algorithms.map((a) => [a.id, a.label])),
     [algorithms],
   );
+  // Which algorithm "Extract Tags" will run -- SigLIP2 until the user picks
+  // something else from the dropdown. Only meaningful before a run starts,
+  // same as judgesEnabled/embeddingEnabled.
+  const [selectedAlgorithm, setSelectedAlgorithm] = useState("siglip");
 
   // Filenames offered by the "select an image" grid, and which one (if any)
   // is currently picked -- `null` when the active image instead came from
@@ -617,39 +825,14 @@ export default function Home() {
   const [selectedSample, setSelectedSample] = useState<string | null>(null);
   const [sampleGridExpanded, setSampleGridExpanded] = useState(false);
 
-  // The run in progress (or just completed): each algorithm's independent
-  // tagging/generation state, keyed by algorithm id. Empty means no run is
-  // active, which is also what gates the file input -- one run at a time.
-  // `runAlgorithms` is just this object's keys (insertion order is
-  // preserved for the non-numeric string keys used here), kept as its own
-  // derived value rather than a second piece of state that could drift out
-  // of sync with `results`.
-  const [results, setResults] = useState<Record<string, RunResult>>({});
-  const runAlgorithms = Object.keys(results);
-  const runActive = runAlgorithms.length > 0;
+  // The run in progress (or just completed): the algorithm it used and its
+  // tagging/generation state. `null` means no run is active, which is also
+  // what gates the file input and the algorithm/judges/embedding controls
+  // -- one run at a time.
+  const [run, setRun] = useState<{ algorithm: string; result: RunResult } | null>(null);
+  const runActive = run !== null;
   const busy =
-    runActive &&
-    Object.values(results).some((r) => r.status === "loading" || r.generating);
-
-  // Suite-mode-only: algorithms that finished tagging but haven't had a song
-  // generated (or started generating) yet -- feeds the SigLIP-only auto-chain
-  // effect below. Memoized on `results` so its identity only changes when
-  // membership actually does, not on every render -- the effect below depends
-  // on it directly.
-  const pendingGenerateAlgorithms = useMemo(
-    () =>
-      Object.keys(results).filter((id) => {
-        const result = results[id];
-        return (
-          result?.status === "ready" &&
-          result.analysis &&
-          !result.generated &&
-          !result.generating &&
-          !result.generateError
-        );
-      }),
-    [results],
-  );
+    runActive && (run.result.status === "loading" || Boolean(run.result.generating));
 
   // Deleting is irreversible and nothing is backed up, so the button has to be
   // clicked twice. This holds whether it is currently armed.
@@ -687,6 +870,42 @@ export default function Home() {
     const timer = setTimeout(() => setArmed(false), 4000);
     return () => clearTimeout(timer);
   }, [armed]);
+
+  // Escape closes the Genre Knob modal, same as its X button/backdrop click.
+  // Tab/Shift+Tab are trapped within the panel so keyboard focus can't reach
+  // (and activate) the "Extract Tags" button or algorithm dropdown sitting
+  // behind the backdrop while the modal is still open on screen.
+  useEffect(() => {
+    if (!genreModalOpen) return;
+    const panel = genreModalRef.current;
+    const focusable = panel
+      ? Array.from(
+          panel.querySelectorAll<HTMLElement>(
+            'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+          ),
+        )
+      : [];
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    (first ?? panel)?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setGenreModalOpen(false);
+        return;
+      }
+      if (event.key !== "Tab" || !first || !last) return;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [genreModalOpen]);
 
   // Whether an image is picked at all -- either an uploaded `file` or a
   // `selectedSample` filename, mutually exclusive with each other. Gates
@@ -737,7 +956,7 @@ export default function Home() {
       );
       setFile(null);
       setSelectedSample(null);
-      setResults({});
+      setRun(null);
       setQuery("");
       setNotice(
         `Deleted ${data.files_removed} files, ${data.megabytes_freed} MB freed.`,
@@ -755,13 +974,21 @@ export default function Home() {
     }
   }
 
-  // Returns rather than writes to `results` directly -- startRun below
-  // waits for every algorithm's call to settle before committing any of
-  // them, so the cards reveal together instead of one at a time.
-  async function tagOneAlgorithm(algorithm: string): Promise<[string, RunResult]> {
-    if (!hasImage) return [algorithm, { status: "error", error: "No image selected." }];
+  // FormData is what makes these file uploads. Note neither /tag nor
+  // /generate ever sets a Content-Type header: the browser has to set that
+  // itself so it can include the multipart boundary marker.
+  function startRun(algorithm: string) {
+    if (!hasImage || runActive) return;
 
-    const params = new URLSearchParams({ algorithm, judges: String(judgesEnabled) });
+    setError(null);
+    setNotice(null);
+    setRun({ algorithm, result: { status: "loading" } });
+
+    const params = new URLSearchParams({
+      algorithm,
+      judges: String(judgesEnabled),
+      show_embedding: String(embeddingEnabled),
+    });
     if (genre) params.set("genre", genre);
 
     let body: FormData | undefined;
@@ -772,67 +999,38 @@ export default function Home() {
       params.set("sample_image", selectedSample);
     }
 
-    try {
-      const data: Analysis = await apiRequest(
-        `${API_URL}/tag?${params}`,
-        { method: "POST", body },
-        `Could not analyze the image with ${algorithm}.`,
+    apiRequest(
+      `${API_URL}/tag?${params}`,
+      { method: "POST", body },
+      `Could not analyze the image with ${algorithm}.`,
+    )
+      .then((data: Analysis) => setRun({ algorithm, result: { status: "ready", analysis: data } }))
+      .catch((err) =>
+        setRun({
+          algorithm,
+          result: { status: "error", error: err instanceof Error ? err.message : String(err) },
+        }),
       );
-      return [algorithm, { status: "ready", analysis: data }];
-    } catch (err) {
-      return [
-        algorithm,
-        { status: "error", error: err instanceof Error ? err.message : String(err) },
-      ];
-    }
   }
 
-  // FormData is what makes these file uploads. Note neither /tag nor
-  // /generate ever sets a Content-Type header: the browser has to set that
-  // itself so it can include the multipart boundary marker.
-  function startRun(algorithmIds: string[]) {
-    if (!hasImage || runActive) return;
+  async function handleGenerate() {
+    if (!run || !hasImage || !run.result.analysis) return;
+    const analysis = run.result.analysis;
+    const { algorithm, result } = run;
 
-    setError(null);
-    setNotice(null);
-    setResults(
-      Object.fromEntries(algorithmIds.map((id) => [id, { status: "loading" as const }])),
-    );
-
-    // Parallel calls, one per algorithm, but all committed to `results`
-    // together once every one has settled -- otherwise faster algorithms'
-    // cards would pop from "loading" to ready individually while slower
-    // ones are still spinning, which reads as flaky rather than "still
-    // working." A bit slower overall (bounded by the slowest algorithm) in
-    // exchange for every card updating at once. Still one independent
-    // request per algorithm, so one failure doesn't block or blank the
-    // others -- tagOneAlgorithm catches its own errors into a per-algorithm
-    // result rather than rejecting, so Promise.all here always resolves.
-    Promise.all(algorithmIds.map((id) => tagOneAlgorithm(id))).then((entries) => {
-      setResults((previous) => ({ ...previous, ...Object.fromEntries(entries) }));
-    });
-  }
-
-  async function handleGenerate(algorithm: string) {
-    const result = results[algorithm];
-    if (!hasImage || !result?.analysis) return;
-
-    setResults((previous) => ({
-      ...previous,
-      [algorithm]: { ...previous[algorithm], generating: true, generateError: undefined },
-    }));
+    setRun({ algorithm, result: { ...result, generating: true, generateError: undefined } });
 
     // Unlike /tag, /generate never re-tags the image -- it only needs the
     // original filename (for the audio naming convention), not the bytes,
     // so there's no reason to re-upload the whole file here.
     const body = new FormData();
     body.append("image_filename", file ? file.name : (selectedSample ?? ""));
-    body.append("tags", JSON.stringify(result.analysis.tags));
-    body.append("tag_scores", JSON.stringify(result.analysis.tag_scores));
-    body.append("tagging", JSON.stringify(result.analysis.tagging));
-    body.append("prompt", result.analysis.prompt);
+    body.append("tags", JSON.stringify(analysis.tags));
+    body.append("tag_scores", JSON.stringify(analysis.tag_scores));
+    body.append("tagging", JSON.stringify(analysis.tagging));
+    body.append("prompt", analysis.prompt);
 
-    const params = new URLSearchParams({ algorithm: result.analysis.algorithm });
+    const params = new URLSearchParams({ algorithm: analysis.algorithm });
     if (genre) params.set("genre", genre);
 
     try {
@@ -841,43 +1039,25 @@ export default function Home() {
         { method: "POST", body },
         "Could not generate a song.",
       );
-      setResults((previous) => ({
-        ...previous,
-        [algorithm]: { ...previous[algorithm], generating: false, generated: data },
-      }));
+      setRun({ algorithm, result: { ...result, generating: false, generated: data } });
     } catch (err) {
-      setResults((previous) => ({
-        ...previous,
-        [algorithm]: {
-          ...previous[algorithm],
+      setRun({
+        algorithm,
+        result: {
+          ...result,
           generating: false,
           generateError: err instanceof Error ? err.message : String(err),
         },
-      }));
+      });
     }
   }
-
-  // SigLIP-only ("Generate Song") auto-chains straight from tagging into
-  // generation -- no manual second click, unlike Suite mode's per-row
-  // "Generate song" button. `pendingGenerateAlgorithms` already excludes
-  // anything generating/generated/not-ready, so this only ever fires once
-  // per run: reading `results` (not calling handleGenerate synchronously
-  // inside startRun's tagging `.then()`) avoids acting on a stale closure
-  // of `results` from before the tagging state actually committed.
-  useEffect(() => {
-    if (runAlgorithms.length !== 1) return;
-    if (pendingGenerateAlgorithms.length !== 1) return;
-    handleGenerate(pendingGenerateAlgorithms[0]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- handleGenerate is redefined every render; pendingGenerateAlgorithms already tracks everything this effect needs to re-fire on
-  }, [pendingGenerateAlgorithms, runAlgorithms.length]);
 
   return (
     <main className="page">
       <header className="hero">
-        <h1 className="title">Ideagream Studio</h1>
+        <h1 className="title">Ideagram Studio</h1>
         <p className="subtitle">
-          A better way to compose mood-accurate songs from images using joint
-          embedding spaces
+          A better way to compose mood-accurate songs from images using joint embedding spaces
         </p>
       </header>
 
@@ -906,6 +1086,7 @@ export default function Home() {
                 aria-label={`Select sample image: ${name.replace(/\.png$/, "")}`}
                 aria-pressed={selectedSample === name}
               >
+                {/* eslint-disable-next-line @next/next/no-img-element -- local backend-served URL, not a remote image */}
                 <img src={`${API_URL}/test-image-files/${name}`} alt="" />
               </button>
             ),
@@ -928,7 +1109,20 @@ export default function Home() {
       </div>
 
       <div className="upload-card">
+        <div className="genre-knob-trigger">
+          <button
+            type="button"
+            onClick={() => setGenreModalOpen(true)}
+            disabled={runActive || busy}
+            className="btn-sm"
+          >
+            Genre Knob
+          </button>
+          {genre && <p className="note">{genre}</p>}
+        </div>
+
         <h2 className="section-title">Upload your own</h2>
+        <p className="note">Uses the Suno v5.5 model</p>
 
         <input
           type="file"
@@ -943,29 +1137,48 @@ export default function Home() {
 
         <div className="run-buttons">
           <button
-            onClick={() => startRun(["siglip"])}
+            onClick={() => startRun(selectedAlgorithm)}
             disabled={!hasImage || runActive || busy}
             className="btn-primary btn-lg btn-run-primary"
           >
-            Generate Song
-          </button>
-          <button
-            onClick={() => startRun(algorithms.map((a) => a.id))}
-            disabled={!hasImage || runActive || busy || algorithms.length === 0}
-            className="btn-primary btn-lg btn-run-secondary"
-          >
-            {algorithms.length} Algorithm Suite
+            Extract Tags
           </button>
 
-          <label className="judges-toggle">
-            <input
-              type="checkbox"
-              checked={judgesEnabled}
-              disabled={runActive || busy}
-              onChange={(event) => setJudgesEnabled(event.target.checked)}
-            />
-            LLM judges
-          </label>
+          <select
+            value={selectedAlgorithm}
+            disabled={runActive || busy || algorithms.length === 0}
+            onChange={(event) => setSelectedAlgorithm(event.target.value)}
+            className="algorithm-select"
+            aria-label="Embedding algorithm"
+          >
+            {algorithms.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.label}
+              </option>
+            ))}
+          </select>
+
+          <div className="toggle-stack">
+            <label className="toggle-field">
+              <input
+                type="checkbox"
+                checked={judgesEnabled}
+                disabled={runActive || busy}
+                onChange={(event) => setJudgesEnabled(event.target.checked)}
+              />
+              LLM judges
+            </label>
+
+            <label className="toggle-field">
+              <input
+                type="checkbox"
+                checked={embeddingEnabled}
+                disabled={runActive || busy}
+                onChange={(event) => setEmbeddingEnabled(event.target.checked)}
+              />
+              Embedding space visual
+            </label>
+          </div>
         </div>
 
 
@@ -973,21 +1186,14 @@ export default function Home() {
         {notice && <p className="status-notice">{notice}</p>}
       </div>
 
-      {runActive && (
+      {run && (
         <div className="runs">
-          {runAlgorithms.map((algorithm, index) => (
-            <RunRow
-              key={algorithm}
-              algorithmLabel={algorithmLabels[algorithm] ?? algorithm}
-              previewUrl={previewUrl}
-              result={
-                results[algorithm] ?? { status: "loading" as const }
-              }
-              onGenerate={() => handleGenerate(algorithm)}
-              showEmbedding={runAlgorithms.length > 1}
-              reversed={index % 2 === 1}
-            />
-          ))}
+          <RunRow
+            algorithmLabel={algorithmLabels[run.algorithm] ?? run.algorithm}
+            previewUrl={previewUrl}
+            result={run.result}
+            onGenerate={handleGenerate}
+          />
         </div>
       )}
 
@@ -1001,61 +1207,96 @@ export default function Home() {
         </button>
       </div>
 
-      <div className="genre-card">
-        <h2 className="section-title">
-          Genre Knob <span className="meta-label">Optional</span>
-        </h2>
+      <AboutSection algorithms={algorithms} />
 
-        <section className="genre">
-          <SpinKnob
-            options={genres}
-            value={genre}
-            onChange={setQuery}
-            label="Genre"
-            disabled={busy || runActive}
-          />
-
-          <div className="genre-fields">
-            <label htmlFor="genre-search" className="genre-label">
-              Genre
-            </label>
-
-            <input
-              id="genre-search"
-              list="genre-options"
-              value={query}
-              disabled={busy || runActive}
-              placeholder="spin, search or roll"
-              onChange={(event) => setQuery(event.target.value)}
-              className="genre-input"
-            />
-            <datalist id="genre-options">
-              {genres.map((name) => (
-                <option key={name} value={name} />
-              ))}
-            </datalist>
-
-            <div className="row">
+      {genreModalOpen && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            genreBackdropMouseDownOnSelf.current = event.target === event.currentTarget;
+          }}
+          onClick={() => {
+            // Only closes when the mousedown that started this click also
+            // landed on the backdrop itself -- otherwise a text-selection
+            // drag that starts inside the panel and ends outside it would
+            // close the modal, since a click's target is computed from
+            // where the mouse went up, not where the drag began.
+            if (genreBackdropMouseDownOnSelf.current) setGenreModalOpen(false);
+          }}
+        >
+          <div
+            ref={genreModalRef}
+            className="genre-card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Genre Knob"
+            tabIndex={-1}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 className="section-title">
+              Genre Knob <span className="meta-label">Optional</span>
               <button
                 type="button"
-                onClick={rollRandomGenre}
-                disabled={busy || runActive || genres.length === 0}
-                className="btn-sm"
+                onClick={() => setGenreModalOpen(false)}
+                aria-label="Close"
+                className="modal-close"
               >
-                🎲 Random
+                ✕
               </button>
-              <button
-                type="button"
-                onClick={() => setQuery("")}
-                disabled={busy || runActive || !query}
-                className="btn-sm"
-              >
-                Clear
-              </button>
-            </div>
+            </h2>
+
+            <section className="genre">
+              <SpinKnob
+                options={genres}
+                value={genre}
+                onChange={setQuery}
+                label="Genre"
+                disabled={busy || runActive}
+              />
+
+              <div className="genre-fields">
+                <label htmlFor="genre-search" className="genre-label">
+                  Genre
+                </label>
+
+                <input
+                  id="genre-search"
+                  list="genre-options"
+                  value={query}
+                  disabled={busy || runActive}
+                  placeholder="spin, search or roll"
+                  onChange={(event) => setQuery(event.target.value)}
+                  className="genre-input"
+                />
+                <datalist id="genre-options">
+                  {genres.map((name) => (
+                    <option key={name} value={name} />
+                  ))}
+                </datalist>
+
+                <div className="row">
+                  <button
+                    type="button"
+                    onClick={rollRandomGenre}
+                    disabled={busy || runActive || genres.length === 0}
+                    className="btn-sm"
+                  >
+                    🎲 Random
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setQuery("")}
+                    disabled={busy || runActive || !query}
+                    className="btn-sm"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+            </section>
           </div>
-        </section>
-      </div>
+        </div>
+      )}
     </main>
   );
 }

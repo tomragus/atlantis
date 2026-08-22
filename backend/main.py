@@ -2,6 +2,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -20,7 +21,7 @@ from genres import GENRES, prompt_term, validate_genre
 # so os.environ can see them below.
 load_dotenv()
 
-app = FastAPI(title="Ideagream Studio")
+app = FastAPI(title="Ideagram Studio")
 
 # Pillow opens more than these, but the frontend's file picker and the tagger are
 # only exercised against the common web formats, so the rest are turned away.
@@ -274,12 +275,16 @@ def list_algorithms() -> list[dict]:
     return [{"id": algorithm, **ALGORITHM_INFO[algorithm]} for algorithm in ALGORITHMS]
 
 
+@lru_cache(maxsize=1)
 def known_sample_images() -> set[str]:
     """Every filename /tag's `sample_image` param is allowed to name.
 
     Shared by `list_test_images` (the picker's listing) and `tag`'s own
     validation below, so the two can't drift out of sync -- a filename the
-    grid offers is always one `tag` will accept, and vice versa.
+    grid offers is always one `tag` will accept, and vice versa. Cached
+    rather than re-globbing the directory on every request: the corpus is
+    static for the life of the server, same assumption `embedding_tagger.py`
+    already makes about a loaded model's vocabulary.
     """
     return {p.name for p in TEST_IMAGES_DIR.glob("*.png")}
 
@@ -319,6 +324,7 @@ def tag(
     genre: str = "",
     algorithm: str = "siglip",
     judges: bool = True,
+    show_embedding: bool = False,
 ):
     """Runs the tagging half of the pipeline only: embedding scoring + the judge.
 
@@ -332,6 +338,12 @@ def tag(
     not just an ignored result) -- the frontend's LLM-judges toggle, for
     when a user wants the embedding tags as-is without the extra Claude
     cost/latency. Tags are then exactly `select_tags`'s output.
+
+    `show_embedding=False` (the default) skips `embedding_projection` entirely
+    -- the frontend's "Embedding space visual" toggle, off by default, for
+    when a user doesn't want the PCA/SVD work spent on a plot nobody will
+    look at. `tagging["embedding"]` is only present in the response when
+    this is `True`.
 
     Exactly one of `image` (an upload) or `sample_image` (a filename from
     `GET /test-images`) must be given -- both or neither is a 400, not a
@@ -425,12 +437,19 @@ def tag(
     # "judges were skipped" -- both look identical as empty `judge`/
     # `contradictions` lists otherwise.
     tagging["judges_enabled"] = judges
-    tagging["embedding"] = embedding_projection(
-        image_bytes,
-        [(point["tag"], point["facet"]) for point in tagging["final"]],
-        algorithm=algorithm,
-        image_vector=image_vector,
-    )
+    # Same reasoning as judges_enabled: `tagging["embedding"]`'s mere absence
+    # already signals "not requested" today (embedding_projection's output is
+    # never itself empty/falsy), but an explicit field means a future reader
+    # doesn't have to know that implicit contract to recover this request's
+    # actual show_embedding value -- e.g. if it's ever logged to history.
+    tagging["embedding_enabled"] = show_embedding
+    if show_embedding:
+        tagging["embedding"] = embedding_projection(
+            image_bytes,
+            [(point["tag"], point["facet"]) for point in tagging["final"]],
+            algorithm=algorithm,
+            image_vector=image_vector,
+        )
 
     # The genre leads the prompt rather than using Suno's `style` parameter,
     # which is its documented home but made no audible difference in testing.

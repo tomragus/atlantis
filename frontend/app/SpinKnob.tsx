@@ -14,10 +14,10 @@ type Props = {
   disabled?: boolean;
 };
 
-// A drag/keyboard-driven picker over a flat list of string options, originally
-// built for the genre picker and generalized to drive the algorithm selector too
-// -- both need the same "spin to browse, snap to the nearest option" behavior,
-// just over a different list and with independent state.
+// A drag/keyboard-driven picker over a flat list of string options -- "spin to
+// browse, snap to the nearest option" -- currently used for the genre picker.
+// General enough to reuse for another option list should one need the same
+// knob-style interaction later.
 export default function SpinKnob({ options, value, onChange, label, disabled }: Props) {
   const [rotation, setRotation] = useState(0);
   const [seenValue, setSeenValue] = useState(value);
@@ -111,50 +111,26 @@ export default function SpinKnob({ options, value, onChange, label, disabled }: 
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
       onKeyDown={handleKeyDown}
+      className="spin-knob"
+      // Only the two properties that actually vary across renders stay
+      // inline -- everything constant (size, border, background, layout)
+      // lives in the .spin-knob CSS class instead, so a drag's per-pointer-
+      // move re-render doesn't reallocate an ~20-property style object for
+      // values that never change.
       style={{
-        width: 120,
-        height: 120,
-        flexShrink: 0,
-        borderRadius: "50%",
-        border: "1px solid var(--line-strong)",
-        background: "var(--paper-dim)",
-        boxShadow: "var(--shadow-sm)",
-        position: "relative",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        // Without this, dragging on a touchscreen scrolls the page instead.
-        touchAction: "none",
         cursor: disabled ? "default" : "grab",
         opacity: disabled ? 0.5 : 1,
-        userSelect: "none",
       }}
     >
       <div
+        className="spin-knob-marker"
         style={{
-          position: "absolute",
-          top: 6,
-          left: "50%",
-          width: 4,
-          height: 18,
-          background: "var(--accent)",
-          borderRadius: 2,
           // 54px is the distance from the marker's own top to the knob's center.
           transformOrigin: "50% 54px",
           transform: `translateX(-50%) rotate(${rotation}deg)`,
         }}
       />
-      <span
-        style={{
-          fontSize: "0.75rem",
-          textAlign: "center",
-          padding: "0 1.1rem",
-          lineHeight: 1.25,
-          pointerEvents: "none",
-        }}
-      >
-        {value || "—"}
-      </span>
+      <span className="spin-knob-label">{value || "—"}</span>
     </div>
   );
 }

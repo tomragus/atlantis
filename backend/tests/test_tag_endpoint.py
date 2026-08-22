@@ -12,7 +12,7 @@ IMPORTANT: like /generate (see test_generate_endpoint.py), /tag mixes a
 `File(...)` parameter (image) with plain `str` parameters (genre,
 algorithm), so FastAPI resolves genre/algorithm as query parameters, not
 form fields -- the frontend already calls it that way (see
-`tagOneAlgorithm` in frontend/app/page.tsx). Every request below passes
+`startRun` in frontend/app/page.tsx). Every request below passes
 them via `params=`, never `data=`; sending them as form data would silently
 fall back to the defaults instead of actually exercising validation (or, for
 an unmocked algorithm, risk loading a real, undownloaded model).
@@ -120,7 +120,7 @@ def test_tag_happy_path(client, monkeypatch, fake_siglip_state):
     resp = client.post(
         "/tag",
         files={"image": ("x.png", png_bytes(), "image/png")},
-        params={"genre": "jazz", "algorithm": "siglip"},
+        params={"genre": "jazz", "algorithm": "siglip", "show_embedding": "true"},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -135,6 +135,23 @@ def test_tag_happy_path(client, monkeypatch, fake_siglip_state):
     assert len(body["tagging"]["final"]) == expected_tag_count
     assert body["tagging"]["embedding"]["model"] == "google/siglip2-base-patch16-224"
     assert body["tagging"]["judges_enabled"] is True
+    assert body["tagging"]["embedding_enabled"] is True
+
+
+def test_tag_omits_embedding_by_default(client, monkeypatch, fake_siglip_state):
+    fake_vector = fake_siglip_state.text_vectors["mood"][0].unsqueeze(0)
+    _patch_embed_image(monkeypatch, fake_vector)
+    _no_flags(monkeypatch)
+
+    resp = client.post(
+        "/tag",
+        files={"image": ("x.png", png_bytes(), "image/png")},
+        params={"algorithm": "siglip"},
+    )
+    assert resp.status_code == 200
+    tagging = resp.json()["tagging"]
+    assert "embedding" not in tagging
+    assert tagging["embedding_enabled"] is False
 
 
 def test_tag_without_genre_omits_it_from_prompt(client, monkeypatch, fake_siglip_state):

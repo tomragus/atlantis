@@ -159,6 +159,7 @@ a:hover {
 }
 
 .upload-card {
+  position: relative;
   padding: 1.5rem;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -167,10 +168,35 @@ a:hover {
   box-shadow: var(--shadow-sm);
 }
 
+.genre-knob-trigger {
+  position: absolute;
+  top: 1.1rem;
+  right: 1.1rem;
+  max-width: 9rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35rem;
+}
+
+.genre-knob-trigger .note {
+  margin: 0;
+  text-align: right;
+  white-space: normal;
+  word-break: break-word;
+}
+
 .run-buttons {
   display: flex;
+  align-items: flex-start;
   gap: 0.75rem;
   flex-wrap: wrap;
+}
+
+.toggle-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
 }
 
 .run-buttons .btn-lg {
@@ -182,11 +208,23 @@ a:hover {
   flex: 3;
 }
 
-.btn-run-secondary {
+.algorithm-select {
   flex: 1;
+  min-width: 9rem;
+  padding: 0.8rem 1.4rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 0.95rem;
 }
 
-.judges-toggle {
+.algorithm-select:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.toggle-field {
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -196,11 +234,11 @@ a:hover {
   white-space: nowrap;
 }
 
-.judges-toggle input {
+.toggle-field input {
   cursor: pointer;
 }
 
-.judges-toggle:has(input:disabled) {
+.toggle-field:has(input:disabled) {
   cursor: default;
   opacity: 0.6;
 }
@@ -256,10 +294,6 @@ a:hover {
   text-transform: uppercase;
   font-size: 0.66rem;
   color: var(--ink-faint);
-}
-
-.mono {
-  font-family: var(--font-geist-mono), ui-monospace, monospace;
 }
 
 .status-error {
@@ -403,13 +437,85 @@ input[type="file"]::file-selector-button:hover {
   margin: 1.5rem 0 0.5rem;
 }
 
-/* ---- genre picker (full-width card, bottom of the page) --------------- */
+/* ---- genre picker (opened from "Upload your own" as a modal) ---------- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(32, 29, 25, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  z-index: 50;
+}
 
 .genre-card {
   padding: 0.9rem 1.1rem;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--paper);
+  width: 100%;
+  max-width: 32rem;
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+  box-shadow: var(--shadow);
+}
+
+.genre-card .section-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.modal-close {
+  margin-left: auto;
+  border: none;
+  background: none;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.25rem 0.35rem;
+}
+
+.modal-close:hover {
+  color: var(--ink);
+}
+
+.spin-knob {
+  width: 120px;
+  height: 120px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background: var(--paper-dim);
+  box-shadow: var(--shadow-sm);
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Without this, dragging on a touchscreen scrolls the page instead. */
+  touch-action: none;
+  user-select: none;
+}
+
+.spin-knob-marker {
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  width: 4px;
+  height: 18px;
+  background: var(--accent);
+  border-radius: 2px;
+}
+
+.spin-knob-label {
+  font-size: 0.75rem;
+  text-align: center;
+  padding: 0 1.1rem;
+  line-height: 1.25;
+  pointer-events: none;
 }
 
 .genre {
@@ -456,12 +562,6 @@ input[type="file"]::file-selector-button:hover {
   background: var(--paper);
   color: var(--ink);
   box-shadow: var(--shadow-sm);
-}
-
-/* Suite mode alternates image-left/image-right row to row so a long list of
-   algorithms doesn't read as one repetitive column down the page. */
-.run-row-reversed {
-  flex-direction: row-reverse;
 }
 
 /* Image plus (once ready) the embedding plot stacked beneath it, so the
@@ -689,13 +789,6 @@ input[type="file"]::file-selector-button:hover {
   color: var(--ink-soft);
 }
 
-.take-name {
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--ink-soft);
-}
-
 audio {
   width: 100%;
   margin-top: 0.5rem;
@@ -705,4 +798,43 @@ audio {
   margin-top: 1.75rem;
   padding-top: 1.25rem;
   border-top: 1px dashed var(--line);
+}
+
+/* ---- about section: plain background text, no card ------------------- */
+
+.about {
+  padding-top: 0.5rem;
+  font-size: 0.8rem;
+  line-height: 1.7;
+  color: var(--ink-soft);
+}
+
+.about p,
+.about ul {
+  margin: 0 0 1rem;
+  max-width: 62rem;
+}
+
+.about ul {
+  padding-left: 1.4rem;
+}
+
+.about li {
+  margin-bottom: 0.3rem;
+}
+
+.about-heading {
+  margin: 2rem 0 0.75rem;
+  font-family: var(--font-source-serif), Georgia, serif;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+h2.about-heading {
+  font-size: 1.22rem;
+  margin-top: 0;
+}
+
+h3.about-heading {
+  font-size: 0.98rem;
 }

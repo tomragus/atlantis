@@ -19,7 +19,7 @@ const sourceSerif = Source_Serif_4({
 });
 
 export const metadata: Metadata = {
-  title: "Ideagream Studio",
+  title: "Ideagram Studio",
   description: "Turn a picture into a piece of music.",
 };
 
