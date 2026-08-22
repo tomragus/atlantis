@@ -44,9 +44,8 @@ AUDIO_DIR = HISTORY_DIR / "audio"
 
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
-# The repo-root sample image set (also used by eval/judge.py), served so the
-# frontend's "select an image" grid can offer them without the user needing
-# their own file.
+# The repo-root sample image set, served so the frontend's "select an image"
+# grid can offer them without the user needing their own file.
 TEST_IMAGES_DIR = Path(__file__).parent.parent / "test-images"
 
 # The Next.js dev server is a different origin, which browsers block by default.
@@ -365,8 +364,8 @@ def tag(
         word_to_facet,
         embedding_projection,
     )
-    from judge import judge_image
-    from contradiction_judge import judge_contradictions
+    from judge_1 import judge_image
+    from judge_2 import judge_contradictions
 
     validate_genre(genre)
     validate_algorithm(algorithm)

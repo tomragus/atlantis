@@ -1,10 +1,9 @@
 """LLM-as-judge: asks Claude Sonnet 5 (vision) whether a SigLIP tag actually fits
 the image it was chosen for.
 
-Shared by the live app (main.py's /generate, to swap out a bad tag before it reaches
-the prompt) and the offline eval script (eval/judge.py, to report how often SigLIP's
-picks hold up). Imported lazily, same convention as embedding_tagger, since anthropic
-and its network client aren't needed until a request actually calls the judge.
+Used by main.py's /generate to swap out a bad tag before it reaches the prompt.
+Imported lazily, same convention as embedding_tagger, since anthropic and its
+network client aren't needed until a request actually calls the judge.
 """
 
 import base64

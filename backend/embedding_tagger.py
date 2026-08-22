@@ -348,13 +348,3 @@ def drop_flagged_tags(
     new_tags = [tag for tag in tags if tag not in flagged]
     new_scores = {tag: scores[tag] for tag in new_tags}
     return new_tags, new_scores
-
-
-def siglip_tags_by_facet(image_bytes: bytes) -> dict[str, list[tuple[str, float]]]:
-    """SigLIP-only wrapper over `tags_by_facet`, kept for `eval/judge.py`'s import."""
-    return tags_by_facet(image_bytes, algorithm="siglip")
-
-
-def siglip_tags(image_bytes: bytes) -> tuple[list[str], dict[str, float]]:
-    """Returns 10 adjectives describing the image, plus each one's score."""
-    return select_tags(siglip_tags_by_facet(image_bytes))

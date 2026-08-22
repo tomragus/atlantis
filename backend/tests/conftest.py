@@ -2,8 +2,8 @@
 
 Nothing in here (or in any test) may reach apiframe/Suno or Claude -- those
 calls are always monkeypatched out at their module boundary
-(`requests.request`/`requests.get` in main.py, `call_judge` in judge.py/
-contradiction_judge.py). The embedding models are handled the same way:
+(`requests.request`/`requests.get` in main.py, `call_judge` in judge_1.py/
+judge_2.py). The embedding models are handled the same way:
 `fake_algorithm_state` swaps in small synthetic vectors so the real
 ranking/quota/projection math in embedding_tagger.py still runs, without
 downloading or loading any actual model weights.

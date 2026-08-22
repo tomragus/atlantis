@@ -3,10 +3,10 @@ describe contradicting moods, since each tag is scored per-facet and independent
 of the others -- nothing stops "joyful" (valence) and "haunting" (mood) from both
 landing in the same 10 words.
 
-Runs after judge.py's per-tag mood check, on the tags it already settled. Text-only:
+Runs after judge_1.py's per-tag mood check, on the tags it already settled. Text-only:
 whether two words contradict each other is a property of the words themselves, not
 the image, so this skips the vision call and its resize/base64 path entirely.
-Imported lazily by main.py, same convention as judge.py.
+Imported lazily by main.py, same convention as judge_1.py.
 """
 
 from judge_client import call_judge

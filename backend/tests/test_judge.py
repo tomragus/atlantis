@@ -1,7 +1,7 @@
-"""Unit tests for judge.py's parsing/fallback logic. `call_judge` (the only
+"""Unit tests for judge_1.py's parsing/fallback logic. `call_judge` (the only
 thing that would reach Claude) is always monkeypatched out."""
 
-import judge
+import judge_1 as judge
 from conftest import png_bytes
 
 

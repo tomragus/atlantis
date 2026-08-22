@@ -5,7 +5,7 @@ through the real FastAPI route.
 The embedding model is swapped for `fake_siglip_state` (see conftest.py) so
 the real ranking/quota/projection code runs against synthetic vectors. The
 two judge passes are monkeypatched at their call site in main.py's imports
-(`judge.judge_image`, `contradiction_judge.judge_contradictions`) so no
+(`judge_1.judge_image`, `judge_2.judge_contradictions`) so no
 Claude call is ever made.
 
 IMPORTANT: like /generate (see test_generate_endpoint.py), /tag mixes a
@@ -32,8 +32,8 @@ def _patch_embed_image(monkeypatch, fake_vector, algorithm="siglip"):
 
 
 def _no_flags(monkeypatch):
-    import contradiction_judge
-    import judge
+    import judge_2 as contradiction_judge
+    import judge_1 as judge
 
     monkeypatch.setattr(
         judge, "judge_image", lambda image_bytes, tags: [
@@ -165,9 +165,9 @@ def test_tag_without_genre_omits_it_from_prompt(client, monkeypatch, fake_siglip
 
 
 def test_tag_drops_tags_flagged_by_vision_judge(client, monkeypatch, fake_siglip_state):
-    import contradiction_judge
+    import judge_2 as contradiction_judge
     import embedding_tagger
-    import judge
+    import judge_1 as judge
 
     fake_vector = fake_siglip_state.text_vectors["mood"][0].unsqueeze(0)
     _patch_embed_image(monkeypatch, fake_vector)
@@ -194,9 +194,9 @@ def test_tag_drops_tags_flagged_by_vision_judge(client, monkeypatch, fake_siglip
 
 
 def test_tag_drops_tag_flagged_by_contradiction_judge(client, monkeypatch, fake_siglip_state):
-    import contradiction_judge
+    import judge_2 as contradiction_judge
     import embedding_tagger
-    import judge
+    import judge_1 as judge
 
     fake_vector = fake_siglip_state.text_vectors["mood"][0].unsqueeze(0)
     _patch_embed_image(monkeypatch, fake_vector)
@@ -229,9 +229,9 @@ def test_tag_drops_tag_flagged_by_contradiction_judge(client, monkeypatch, fake_
 
 
 def test_tag_falls_back_when_vision_judge_raises(client, monkeypatch, fake_siglip_state):
-    import contradiction_judge
+    import judge_2 as contradiction_judge
     import embedding_tagger
-    import judge
+    import judge_1 as judge
 
     fake_vector = fake_siglip_state.text_vectors["mood"][0].unsqueeze(0)
     _patch_embed_image(monkeypatch, fake_vector)
@@ -253,9 +253,9 @@ def test_tag_falls_back_when_vision_judge_raises(client, monkeypatch, fake_sigli
 
 
 def test_tag_falls_back_when_contradiction_judge_raises(client, monkeypatch, fake_siglip_state):
-    import contradiction_judge
+    import judge_2 as contradiction_judge
     import embedding_tagger
-    import judge
+    import judge_1 as judge
 
     fake_vector = fake_siglip_state.text_vectors["mood"][0].unsqueeze(0)
     _patch_embed_image(monkeypatch, fake_vector)
@@ -282,9 +282,9 @@ def test_tag_falls_back_when_contradiction_judge_raises(client, monkeypatch, fak
 
 
 def test_tag_judges_false_skips_both_judge_calls_entirely(client, monkeypatch, fake_siglip_state):
-    import contradiction_judge
+    import judge_2 as contradiction_judge
     import embedding_tagger
-    import judge
+    import judge_1 as judge
 
     fake_vector = fake_siglip_state.text_vectors["mood"][0].unsqueeze(0)
     _patch_embed_image(monkeypatch, fake_vector)
@@ -325,8 +325,8 @@ def test_tag_judges_true_by_default(client, monkeypatch, fake_siglip_state):
         calls.append("judge_contradictions")
         return []
 
-    import contradiction_judge
-    import judge
+    import judge_2 as contradiction_judge
+    import judge_1 as judge
 
     monkeypatch.setattr(judge, "judge_image", spy_judge_image)
     monkeypatch.setattr(contradiction_judge, "judge_contradictions", spy_judge_contradictions)

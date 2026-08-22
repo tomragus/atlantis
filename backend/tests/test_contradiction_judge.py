@@ -1,8 +1,8 @@
-"""Unit tests for contradiction_judge.py's parsing/validation logic.
+"""Unit tests for judge_2.py's parsing/validation logic.
 `call_judge` (the only thing that would reach Claude) is always
 monkeypatched out."""
 
-import contradiction_judge as cj
+import judge_2 as cj
 
 
 TAGS = ["joyful", "haunting", "misty"]

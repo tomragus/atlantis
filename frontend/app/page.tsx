@@ -656,9 +656,9 @@ const AboutSection = memo(function AboutSection({
         region of “feel” (referred to in the code as “facet”). The top few
         tags per facet (specifically: 2 for “color”, 1 for “light”, 3 for
         “mood”, 1 for “valence”, 1 for “arousal”, 2 for “texture”, 1 for
-        “energy”, and 1 for “style”) are use to compose a prompt for the
-        Suno v5.5 Model, which is simply the list of tags in order from
-        highest to lowest score. That prompt is then fed to Suno to produce
+        “energy”, and 1 for “style”) are used to compose a prompt for the
+        Suno v5.5 model, which is simply the list of tags in order from
+        highest to lowest score. That prompt is then fed to Suno v5.5 to produce
         2 highly mood-accurate songs for that image.
       </p>
 
@@ -679,21 +679,21 @@ const AboutSection = memo(function AboutSection({
       </p>
 
       <p>
-        LLM-judge #1 is a vision model that views the image, then each tag,
-        and decides “whether it captures the mood or feeling the image
+        LLM-judge #1 has Claude Sonnet 5 look at the image, then each tag,
+        and decide “whether it captures the mood or feeling the image
         evokes - not whether it’s a literal, physically accurate
         description” (taken directly from the system prompt). If not, the
         tag gets flagged and then dropped from the prompt.
       </p>
 
       <p>
-        LLM-judge #2 is a text model that scans the tag list for any seeming
+        LLM-judge #2 has Claude Sonnet 5 scan the tag list for any seeming
         contradictions between tags across different facets (ex: “joyful”
         from valence and “haunting” from mood). If it identifies a
         contradictory pair, it then checks whether each tag’s feeling is
         already covered by some other tag elsewhere in the list. Whichever
         of the two tags has coverage gets dropped, since it is less
-        descriptive in the final Suno prompt. While this is somewhat
+        descriptive in the final Suno v5.5 prompt. While this is somewhat
         uncommon, there were instances in my testing of the system that
         justified the creation of this judge.
       </p>

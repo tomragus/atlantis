@@ -1,5 +1,5 @@
 """Shared Claude Sonnet 5 structured-output call, used by both judge passes
-(judge.py's per-tag mood check and contradiction_judge.py's cross-facet
+(judge_1.py's per-tag mood check and judge_2.py's cross-facet
 contradiction check) so the client setup and call/parse pattern lives in one
 place instead of two copies that could silently drift apart.
 """
