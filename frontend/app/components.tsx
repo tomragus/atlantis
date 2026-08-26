@@ -5,6 +5,8 @@
 // others), plus the standalone "How it works" write-up.
 
 import { memo, useMemo, useState } from "react";
+import { BlockMath } from "react-katex";
+import "katex/dist/katex.min.css";
 
 import {
   type AlgorithmInfo,
@@ -458,14 +460,17 @@ export const AboutSection = memo(function AboutSection({
         When you upload an image, the SigLIP2 embedding algorithm’s image
         encoder splits the image up into a 14x14 grid of tiles, each of which
         gets turned into a 768-dimensional vector, which is a rich numerical
-        fingerprint capturing color, texture, edges and more. These vectors
-        are initially independent (meaning, each one has no knowledge of the
-        others), but are then fed into 12 transformer layers in which each
-        vector gets iteratively updated based on context from the others.
+        fingerprint capturing color, texture, edges and more. These vectors are
+        initially independent (meaning, each one has no knowledge of the others),
+        but are then fed into 12 transformer layers in which each vector gets
+        iteratively updated based on context from the others.
+      </p>
+
+      <p>
         After this process, the 196 tiles are fed into a single pooling
         layer, which asks each tile “what do you know about this image?”,
-        and composes a single 768-dimensional vector summarizing the
-        responses.
+        and composes a single 768-dimensional vector
+        summarizing the responses.
       </p>
 
       <p>
@@ -486,18 +491,27 @@ export const AboutSection = memo(function AboutSection({
 
       <p>
         Each set of these template phrases gets batched and fed into the text
-        encoder, after which they are stacked and averaged resulting in a
-        single 768-dimensional embedding vector per tag.
+        encoder, after which they are stacked and averaged resulting
+        in a single 768-dimensional embedding vector per tag.
+        After encoding, the cosine similarity between the image vector{" "}
+        <code>v</code> and each tag vector <code>t</code> is calculated:
       </p>
 
+      <BlockMath math={String.raw`s = \cos(\theta) = \frac{v \cdot t}{\|v\|\,\|t\|}`} />
+
       <p>
-        After encoding, the cosine similarity between the image vector and
-        each individual tag are calculated and fed into the sigmoid (hence
-        the name), which contains additional signal directly from SigLIP2’s
-        pre-training to get a final score. If you showed the image to the
-        model and asked “does the phrase ‘a photo that feels {"{tag}"}’
-        genuinely describe this image, yes or no?”, then the final score
-        would be how confident the model is that the answer is yes.
+        That similarity is then fed into a sigmoid (hence the name) with a
+        scale <code>k</code> and bias <code>b</code> learned directly from
+        SigLIP2’s pre-training, to get a final score between 0 and 1:
+      </p>
+
+      <BlockMath math={String.raw`\text{score} = \sigma(k \cdot s + b) = \frac{1}{1 + e^{-(k \cdot s + b)}}`} />
+
+      <p>
+        If you showed the image to the model and asked “does the phrase ‘a
+        photo that feels {"{tag}"}’ genuinely describe this image, yes or
+        no?”, then the final score would be how confident the model is that
+        the answer is yes.
       </p>
 
       <p>
