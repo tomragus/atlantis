@@ -24,6 +24,8 @@ backend/history/
 # Local planning/guidance docs — not meant to be published in the repo
 /CLAUDE.md
 /PLAN.md
+/DEPLOYMENT.md
+/PLAN-phase1-history.md
 
 # Throwaway local sandbox, not part of the app
 /musicgen-experiment/

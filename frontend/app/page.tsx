@@ -2,15 +2,20 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import { AboutSection, RunRow } from "./components";
+import { AboutSection, RunCard } from "./components";
 import GenreKnobModal from "./GenreKnobModal";
 import {
   type AlgorithmInfo,
   API_URL,
   type Analysis,
   apiRequest,
-  type GeneratedSong,
-  type RunResult,
+  type Card,
+  cardFromAnalysis,
+  cardFromRecord,
+  generateUrl,
+  isCardBusy,
+  MAX_CARDS,
+  type SessionRecord,
 } from "./lib";
 
 export default function Home() {
@@ -30,15 +35,15 @@ export default function Home() {
   // Whether /tag runs its two Claude judge passes for the run about to
   // start. On by default; off skips both calls entirely on the backend
   // (see main.py's `judges` param), not just their result. Only meaningful
-  // before a run starts -- the toggle disables once one is active, same as
-  // the genre knob, since it can't retroactively affect tagging that
-  // already happened.
+  // before a run starts -- the toggle disables once starting a new run
+  // isn't allowed (cap reached, or something else in flight), since it
+  // can't retroactively affect tagging that already happened.
   const [judgesEnabled, setJudgesEnabled] = useState(false);
 
   // Whether /tag computes the joint embedding space plot for the run about
   // to start. Off by default; off skips `embedding_projection` entirely on
   // the backend (see main.py's `show_embedding` param), not just its
-  // display. Same disable-once-active convention as judgesEnabled.
+  // display. Same disable convention as judgesEnabled.
   const [embeddingEnabled, setEmbeddingEnabled] = useState(false);
 
   const [algorithms, setAlgorithms] = useState<AlgorithmInfo[]>([]);
@@ -59,14 +64,28 @@ export default function Home() {
   const [selectedSample, setSelectedSample] = useState<string | null>(null);
   const [sampleGridExpanded, setSampleGridExpanded] = useState(false);
 
-  // The run in progress (or just completed): the algorithm it used and its
-  // tagging/generation state. `null` means no run is active, which is also
-  // what gates the file input and the algorithm/judges/embedding controls
-  // -- one run at a time.
-  const [run, setRun] = useState<{ algorithm: string; result: RunResult } | null>(null);
-  const runActive = run !== null;
-  const busy =
-    runActive && (run.result.status === "loading" || Boolean(run.result.generating));
+  // The session's runs, newest first -- each independently at whatever
+  // stage it's reached (tagging in flight, tags extracted, or fully
+  // generated). Hydrated from GET /history on mount so a reload restores
+  // every run that had already reached /tag (see the effect below).
+  const [cards, setCards] = useState<Card[]>([]);
+  // Which cards the user has explicitly toggled open/closed, overriding the
+  // newest-open/rest-collapsed default (see RunCard's `open` formula).
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+
+  // Only one network operation (a tag extraction or a generation) runs at a
+  // time across the whole session -- many settled cards can coexist, but
+  // starting a new one waits for whatever's already in flight.
+  const busy = cards.some((card) => isCardBusy(card.result));
+  // Cards whose /tag call failed never reached the backend's SESSIONS list
+  // (see dropCardLocally below), so they shouldn't count against the cap the
+  // backend actually enforces.
+  const atCap =
+    cards.filter((card) => card.result.status !== "error").length >= MAX_CARDS;
+  // Gates every "start a new run" control (sample picker, file input,
+  // Extract Tags, algorithm/genre/judge/embedding pickers) -- not "a run
+  // exists" the way the old single-run model gated them.
+  const newRunDisabled = atCap || busy;
 
   // Deleting is irreversible and nothing is backed up, so the button has to be
   // clicked twice. This holds whether it is currently armed.
@@ -95,6 +114,15 @@ export default function Home() {
       .then((response) => response.json())
       .then(setSampleImages)
       .catch(offline("Could not load the sample image list."));
+
+    // Rehydrates every run this session already reached /tag for -- as
+    // long as the backend process itself hasn't restarted since (the
+    // in-memory tradeoff; see main.py's SESSIONS). A fresh backend process
+    // just returns an empty list, so this is a no-op on a first run.
+    fetch(`${API_URL}/history`)
+      .then((response) => response.json())
+      .then((records: SessionRecord[]) => setCards(records.map(cardFromRecord)))
+      .catch(offline("Could not load run history."));
   }, []);
 
   // A button that stays armed is its own trap, so it disarms itself shortly
@@ -107,31 +135,14 @@ export default function Home() {
 
   // Whether an image is picked at all -- either an uploaded `file` or a
   // `selectedSample` filename, mutually exclusive with each other. Gates
-  // every run/clear button below, same as a plain `!file` check used to.
+  // the Extract Tags button (on top of newRunDisabled).
   const hasImage = Boolean(file || selectedSample);
-
-  // A live preview of whatever image is picked. An uploaded file gets an
-  // object URL (memoized rather than stored in state so creating it can't
-  // itself trigger a render; the effect below only handles the revoke). A
-  // sample image just points straight at the backend's static route --
-  // plain <img> loads don't need CORS, unlike a `fetch()` of the same URL
-  // would, so there's no bytes to fetch or object URL to manage here.
-  const previewUrl = useMemo(() => {
-    if (file) return URL.createObjectURL(file);
-    if (selectedSample) return `${API_URL}/test-image-files/${selectedSample}`;
-    return null;
-  }, [file, selectedSample]);
-  useEffect(() => {
-    return () => {
-      if (previewUrl?.startsWith("blob:")) URL.revokeObjectURL(previewUrl);
-    };
-  }, [previewUrl]);
 
   // Just records which sample was picked -- no bytes fetched client-side.
   // /tag re-reads them from disk server-side (see main.py's `sample_image`
   // param), so this never needs the browser to GET the image cross-origin.
   function selectSampleImage(name: string) {
-    if (runActive || busy) return;
+    if (newRunDisabled) return;
     setFile(null);
     setSelectedSample(name);
     setError(null);
@@ -154,27 +165,54 @@ export default function Home() {
       );
       setFile(null);
       setSelectedSample(null);
-      setRun(null);
+      setCards([]);
+      setExpanded({});
       setQuery("");
       setNotice(
         `Deleted ${data.files_removed} files, ${data.megabytes_freed} MB freed.`,
       );
     } catch (err) {
-      // A failed wipe leaves the run in place rather than silently resetting
+      // A failed wipe leaves things in place rather than silently resetting
       // the UI while stale files remain on the backend.
       setError(err instanceof Error ? err.message : String(err));
     }
   }
 
-  // FormData is what makes these file uploads. Note neither /tag nor
-  // /generate ever sets a Content-Type header: the browser has to set that
-  // itself so it can include the multipart boundary marker.
+  // FormData is what makes the file upload. Note /tag never sets a
+  // Content-Type header itself: the browser has to set that so it can
+  // include the multipart boundary marker.
+  //
+  // A placeholder card goes in immediately (pinned open by RunCard while
+  // status is "loading") so the in-flight run is visible in the list right
+  // away. For a sample image its imageSource is already knowable
+  // client-side, so RunCard can derive its preview URL immediately; for an
+  // upload imageSource stays null until /tag responds -- deliberately no
+  // client-side object URL standing in for a thumbnail in the meantime --
+  // and the real, backend-served photo appears the moment /tag actually
+  // succeeds and replaces this entry.
+  //
+  // The placeholder's id is generated fresh per call (never a shared
+  // constant): if /tag fails, the placeholder stays in the list as an
+  // error card (see handleDeleteCard -- it never had a backend record, so
+  // it's never in play for /generate or a per-run DELETE), and starting
+  // another run afterwards must not collide with it or with any earlier
+  // failed attempt still sitting in the list.
   function startRun(algorithm: string) {
-    if (!hasImage || runActive) return;
+    if (!hasImage || newRunDisabled) return;
 
     setError(null);
     setNotice(null);
-    setRun({ algorithm, result: { status: "loading" } });
+    const pendingId = `pending-${crypto.randomUUID()}`;
+    setCards((prev) => [
+      {
+        id: pendingId,
+        algorithm,
+        createdAt: new Date().toISOString(),
+        imageSource: selectedSample ? { kind: "sample", name: selectedSample } : null,
+        result: { status: "loading" },
+      },
+      ...prev,
+    ]);
 
     const params = new URLSearchParams({
       algorithm,
@@ -196,51 +234,87 @@ export default function Home() {
       { method: "POST", body },
       `Could not analyze the image with ${algorithm}.`,
     )
-      .then((data: Analysis) => setRun({ algorithm, result: { status: "ready", analysis: data } }))
-      .catch((err) =>
-        setRun({
-          algorithm,
-          result: { status: "error", error: err instanceof Error ? err.message : String(err) },
-        }),
-      );
+      .then((data: Analysis) => {
+        const card = cardFromAnalysis(data);
+        setCards((prev) => prev.map((c) => (c.id === pendingId ? card : c)));
+      })
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        setCards((prev) =>
+          prev.map((c) =>
+            c.id === pendingId ? { ...c, result: { status: "error", error: message } } : c,
+          ),
+        );
+      });
   }
 
-  async function handleGenerate() {
-    if (!run || !hasImage || !run.result.analysis) return;
-    const analysis = run.result.analysis;
-    const { algorithm, result } = run;
+  async function handleGenerate(cardId: string) {
+    const card = cards.find((c) => c.id === cardId);
+    if (!card || card.result.status !== "ready" || busy) return;
 
-    setRun({ algorithm, result: { ...result, generating: true, generateError: undefined } });
-
-    // Unlike /tag, /generate never re-tags the image -- it only needs the
-    // original filename (for the audio naming convention), not the bytes,
-    // so there's no reason to re-upload the whole file here.
-    const body = new FormData();
-    body.append("image_filename", file ? file.name : (selectedSample ?? ""));
-    body.append("tags", JSON.stringify(analysis.tags));
-    body.append("tag_scores", JSON.stringify(analysis.tag_scores));
-    body.append("tagging", JSON.stringify(analysis.tagging));
-    body.append("prompt", analysis.prompt);
-
-    const params = new URLSearchParams({ algorithm: analysis.algorithm });
-    if (genre) params.set("genre", genre);
+    setCards((prev) =>
+      prev.map((c) =>
+        c.id === cardId
+          ? { ...c, result: { ...c.result, generating: true, generateError: undefined } }
+          : c,
+      ),
+    );
 
     try {
-      const data: GeneratedSong = await apiRequest(
-        `${API_URL}/generate?${params}`,
-        { method: "POST", body },
+      const data = await apiRequest(
+        generateUrl(cardId),
+        { method: "POST" },
         "Could not generate a song.",
       );
-      setRun({ algorithm, result: { ...result, generating: false, generated: data } });
+      setCards((prev) =>
+        prev.map((c) =>
+          c.id === cardId ? { ...c, result: { ...c.result, generating: false, generated: data } } : c,
+        ),
+      );
     } catch (err) {
-      setRun({
-        algorithm,
-        result: {
-          ...result,
-          generating: false,
-          generateError: err instanceof Error ? err.message : String(err),
-        },
-      });
+      const message = err instanceof Error ? err.message : String(err);
+      setCards((prev) =>
+        prev.map((c) =>
+          c.id === cardId
+            ? { ...c, result: { ...c.result, generating: false, generateError: message } }
+            : c,
+        ),
+      );
+    }
+  }
+
+  function dropCardLocally(cardId: string) {
+    setCards((prev) => prev.filter((c) => c.id !== cardId));
+    setExpanded((prev) => {
+      if (!(cardId in prev)) return prev;
+      const next = { ...prev };
+      delete next[cardId];
+      return next;
+    });
+  }
+
+  async function handleDeleteCard(cardId: string) {
+    const card = cards.find((c) => c.id === cardId);
+    // A card whose own /tag call failed never made it into the backend's
+    // session list -- there's nothing there to delete, and calling the
+    // endpoint anyway would just 404. Drop it locally instead, same as any
+    // other never-persisted piece of UI state.
+    if (card?.result.status === "error") {
+      dropCardLocally(cardId);
+      return;
+    }
+
+    try {
+      await apiRequest(
+        `${API_URL}/history/${cardId}`,
+        { method: "DELETE" },
+        "Could not delete this run.",
+      );
+      dropCardLocally(cardId);
+    } catch (err) {
+      // Same convention as handleClear: a failed delete leaves the card in
+      // place rather than silently dropping it while its files remain.
+      setError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -270,7 +344,7 @@ export default function Home() {
                 key={name}
                 type="button"
                 onClick={() => selectSampleImage(name)}
-                disabled={runActive || busy}
+                disabled={newRunDisabled}
                 className={
                   "sample-thumb" +
                   (selectedSample === name ? " sample-thumb-selected" : "")
@@ -305,7 +379,7 @@ export default function Home() {
           <button
             type="button"
             onClick={() => setGenreModalOpen(true)}
-            disabled={runActive || busy}
+            disabled={newRunDisabled}
             className="btn-sm"
           >
             Genre Knob
@@ -323,14 +397,14 @@ export default function Home() {
             setFile(event.target.files?.[0] ?? null);
             setSelectedSample(null);
           }}
-          disabled={runActive || busy}
+          disabled={newRunDisabled}
           className="file-picker"
         />
 
         <div className="run-buttons">
           <button
             onClick={() => startRun(selectedAlgorithm)}
-            disabled={!hasImage || runActive || busy}
+            disabled={!hasImage || newRunDisabled}
             className="btn-primary btn-lg btn-run-primary"
           >
             Extract Tags
@@ -338,7 +412,7 @@ export default function Home() {
 
           <select
             value={selectedAlgorithm}
-            disabled={runActive || busy || algorithms.length === 0}
+            disabled={newRunDisabled || algorithms.length === 0}
             onChange={(event) => setSelectedAlgorithm(event.target.value)}
             className="algorithm-select"
             aria-label="Embedding algorithm"
@@ -355,7 +429,7 @@ export default function Home() {
               <input
                 type="checkbox"
                 checked={judgesEnabled}
-                disabled={runActive || busy}
+                disabled={newRunDisabled}
                 onChange={(event) => setJudgesEnabled(event.target.checked)}
               />
               LLM judges
@@ -365,7 +439,7 @@ export default function Home() {
               <input
                 type="checkbox"
                 checked={embeddingEnabled}
-                disabled={runActive || busy}
+                disabled={newRunDisabled}
                 onChange={(event) => setEmbeddingEnabled(event.target.checked)}
               />
               Embedding space visual
@@ -373,29 +447,45 @@ export default function Home() {
           </div>
         </div>
 
+        {atCap && (
+          <p className="status-notice">
+            This session already holds {MAX_CARDS} runs. Delete one below (or Clear) before starting another.
+          </p>
+        )}
 
         {error && <p className="status-error">{error}</p>}
         {notice && <p className="status-notice">{notice}</p>}
       </div>
 
-      {run && (
+      {cards.length > 0 && (
         <div className="runs">
-          <RunRow
-            algorithmLabel={algorithmLabels[run.algorithm] ?? run.algorithm}
-            previewUrl={previewUrl}
-            result={run.result}
-            onGenerate={handleGenerate}
-          />
+          {cards.map((card, index) => (
+            <RunCard
+              key={card.id}
+              card={card}
+              position={index + 1}
+              algorithmLabel={algorithmLabels[card.algorithm] ?? card.algorithm}
+              isNewest={index === 0}
+              expandedOverride={expanded[card.id]}
+              onToggle={(currentlyOpen) =>
+                setExpanded((prev) => ({ ...prev, [card.id]: !currentlyOpen }))
+              }
+              onGenerate={() => handleGenerate(card.id)}
+              onDelete={() => handleDeleteCard(card.id)}
+              generateBusy={busy}
+              deleteDisabled={isCardBusy(card.result)}
+            />
+          ))}
         </div>
       )}
 
       <div className="danger-zone">
         <button
           onClick={handleClear}
-          disabled={!hasImage || busy}
+          disabled={(cards.length === 0 && !hasImage) || busy}
           className={`btn-lg btn-danger${armed ? " is-armed" : ""}`}
         >
-          {armed ? "Clear this run? Click again" : "Clear"}
+          {armed ? "Clear everything? Click again" : "Clear"}
         </button>
       </div>
 
@@ -408,7 +498,7 @@ export default function Home() {
         genre={genre}
         query={query}
         onQueryChange={setQuery}
-        disabled={busy || runActive}
+        disabled={newRunDisabled}
       />
     </main>
   );

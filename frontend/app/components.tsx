@@ -4,12 +4,13 @@
 // small and they're only ever composed together (RunRow uses all the
 // others), plus the standalone "How it works" write-up.
 
-import { memo, useMemo, useState } from "react";
+import { memo, useMemo, useState, type KeyboardEvent } from "react";
 import { BlockMath } from "react-katex";
 import "katex/dist/katex.min.css";
 
 import {
   type AlgorithmInfo,
+  type Card,
   CHECKPOINT_IDS,
   type Embedding,
   type FacetTag,
@@ -19,9 +20,11 @@ import {
   formatScore,
   flaggedJudgeRows,
   contradictionRows,
+  isCardBusy,
   PLOT_HEIGHT,
   PLOT_MARGIN,
   PLOT_WIDTH,
+  previewUrlFor,
   TOOLTIP_HEIGHT,
   type RunResult,
   type Tagging,
@@ -177,7 +180,7 @@ function EmbeddingPlot({
               r={isFinal ? 6 : 4}
               fill={FACET_COLORS[p.facet]}
               opacity={isFinal ? 1 : 0.4}
-              stroke="var(--paper)"
+              stroke="var(--card-bg)"
               strokeWidth={1}
               tabIndex={0}
               onMouseEnter={() => setHovered(p.tag)}
@@ -192,8 +195,8 @@ function EmbeddingPlot({
           cx={centroidX}
           cy={centroidY}
           r={5}
-          fill="var(--paper-dim)"
-          stroke="var(--paper)"
+          fill="var(--card-bg-dim)"
+          stroke="var(--card-bg)"
           strokeWidth={1.5}
           tabIndex={0}
           onMouseEnter={() => setHovered("mean")}
@@ -349,11 +352,17 @@ export function RunRow({
   previewUrl,
   result,
   onGenerate,
+  generateBusy = false,
 }: {
   algorithmLabel: string;
   previewUrl: string | null;
   result: RunResult;
   onGenerate: () => void;
+  // Whether some other card's tag-extraction or generation is in flight --
+  // only one network operation runs at a time across the whole session, so
+  // this card's own Generate Songs button stays disabled while that's true,
+  // on top of `result.generating` covering its own in-flight generation.
+  generateBusy?: boolean;
 }) {
   const embedding = result.analysis?.tagging.embedding;
 
@@ -404,7 +413,7 @@ export function RunRow({
               <div className="actions">
                 <button
                   onClick={onGenerate}
-                  disabled={result.generating}
+                  disabled={result.generating || generateBusy}
                   className="btn-primary"
                 >
                   {result.generating ? "Composing…" : "Generate Songs"}
@@ -435,6 +444,119 @@ export function RunRow({
   );
 }
 
+// A single word summarizing where a card has gotten to -- shown in its
+// collapsed header, and what drives the pinned-open behavior below.
+function cardStatusWord(result: RunResult): string {
+  if (result.status === "loading") return "tagging…";
+  if (result.status === "error") return "error";
+  if (result.generating) return "generating…";
+  if (result.generated) return "generated";
+  return "ready";
+}
+
+// One card in the session list: a header (position, thumbnail, algorithm
+// label, status word, delete control, caret) that's always visible, and
+// (once open) the full RunRow body beneath it. Newest card open by
+// default, the rest collapsed; any header click toggles that card only; a
+// card with in-flight work of its own stays pinned open regardless of its
+// entry in the parent's `expanded` map, the same accordion pattern
+// image-to-song-v1 uses (interaction logic only -- Atlantis's own tokens
+// style it, see globals.css).
+export function RunCard({
+  card,
+  position,
+  algorithmLabel,
+  isNewest,
+  expandedOverride,
+  onToggle,
+  onGenerate,
+  onDelete,
+  generateBusy,
+  deleteDisabled,
+}: {
+  card: Card;
+  position: number;
+  algorithmLabel: string;
+  isNewest: boolean;
+  expandedOverride: boolean | undefined;
+  onToggle: (currentlyOpen: boolean) => void;
+  onGenerate: () => void;
+  onDelete: () => void;
+  generateBusy: boolean;
+  deleteDisabled: boolean;
+}) {
+  const pinnedOpen = isCardBusy(card.result);
+  const open = pinnedOpen || (expandedOverride ?? isNewest);
+  const status = cardStatusWord(card.result);
+  const previewUrl = card.imageSource ? previewUrlFor(card.imageSource) : null;
+
+  function toggleOnKeyDown(event: KeyboardEvent) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onToggle(open);
+    }
+  }
+
+  return (
+    <div className={`run-card${open ? " is-open" : ""}`}>
+      <div className="run-card-head">
+        {/* A `div` rather than a `button` -- the delete control below has
+            to be a real, separately clickable button in the same row, and
+            buttons can't nest. Keyboard-operable via the role/tabIndex/
+            onKeyDown trio instead. */}
+        <div
+          role="button"
+          tabIndex={0}
+          className="run-card-head-toggle"
+          aria-expanded={open}
+          onClick={() => onToggle(open)}
+          onKeyDown={toggleOnKeyDown}
+        >
+          <span className="run-card-index">{String(position).padStart(2, "0")}</span>
+
+          {previewUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element -- local backend-served/static URL
+            <img src={previewUrl} alt="" className="run-card-thumb" />
+          ) : (
+            <span className="run-card-thumb run-card-thumb-empty" aria-hidden="true" />
+          )}
+
+          <span className="run-card-head-text">
+            <span className="run-card-name">{algorithmLabel}</span>
+            <span className="run-card-status">{status}</span>
+          </span>
+
+          <span className="run-card-caret" aria-hidden="true">
+            {open ? "▼" : "►"}
+          </span>
+        </div>
+
+        <button
+          type="button"
+          className="run-card-delete"
+          onClick={onDelete}
+          disabled={deleteDisabled}
+          aria-label={`Delete run ${position}`}
+        >
+          Delete
+        </button>
+      </div>
+
+      {open && (
+        <div className="run-card-body">
+          <RunRow
+            algorithmLabel={algorithmLabel}
+            previewUrl={previewUrl}
+            result={card.result}
+            onGenerate={onGenerate}
+            generateBusy={generateBusy}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Plain background text -- no card, no border -- explaining the pipeline for
 // anyone curious enough to read past the app itself. Only prop is the
 // already-fetched algorithm list, for the checkpoint links' labels; memoized
@@ -459,22 +581,22 @@ export const AboutSection = memo(function AboutSection({
       <p>
         When you upload an image, the SigLIP2 embedding algorithm’s image
         encoder splits the image up into a 14x14 grid of tiles, each of which
-        gets turned into a 768-dimensional vector, which is a rich numerical
+        gets turned into a 768-dimensional vector which is a rich numerical
         fingerprint capturing color, texture, edges and more. These vectors are
-        initially independent (meaning, each one has no knowledge of the others),
+        initially independent (meaning, each one has no knowledge of the others)
         but are then fed into 12 transformer layers in which each vector gets
         iteratively updated based on context from the others.
       </p>
 
       <p>
         After this process, the 196 tiles are fed into a single pooling
-        layer, which asks each tile “what do you know about this image?”,
+        layer which asks each tile “what do you know about this image?”
         and composes a single 768-dimensional vector
         summarizing the responses.
       </p>
 
       <p>
-        Simultaneously, the same embedding process is happening on a curated
+        Simultaneously, that same embedding process is happening on a curated
         set of 261 descriptive vocabulary tags covering 8 distinct regions of
         “feel”, including color, light, mood, valence, arousal, texture,
         energy and style. Because SigLIP2 was trained on captions instead of
@@ -493,14 +615,8 @@ export const AboutSection = memo(function AboutSection({
         Each set of these template phrases gets batched and fed into the text
         encoder, after which they are stacked and averaged resulting
         in a single 768-dimensional embedding vector per tag.
-        After encoding, the cosine similarity between the image vector{" "}
-        <code>v</code> and each tag vector <code>t</code> is calculated:
-      </p>
-
-      <BlockMath math={String.raw`s = \cos(\theta) = \frac{v \cdot t}{\|v\|\,\|t\|}`} />
-
-      <p>
-        That similarity is then fed into a sigmoid (hence the name) with a
+        After encoding, the cosine similarity between the image vector and each tag vector is calculated
+        and fed into a sigmoid (hence the name) with a
         scale <code>k</code> and bias <code>b</code> learned directly from
         SigLIP2’s pre-training, to get a final score between 0 and 1:
       </p>
@@ -508,7 +624,7 @@ export const AboutSection = memo(function AboutSection({
       <BlockMath math={String.raw`\text{score} = \sigma(k \cdot s + b) = \frac{1}{1 + e^{-(k \cdot s + b)}}`} />
 
       <p>
-        If you showed the image to the model and asked “does the phrase ‘a
+        Here’s how to understand this: if you showed the image to the model and asked “does the phrase ‘a
         photo that feels {"{tag}"}’ genuinely describe this image, yes or
         no?”, then the final score would be how confident the model is that
         the answer is yes.
@@ -522,22 +638,21 @@ export const AboutSection = memo(function AboutSection({
         “energy”, and 1 for “style”) are used to compose a prompt for the
         Suno v5.5 model, which is simply the list of tags in order from
         highest to lowest score. That prompt is then fed to Suno v5.5 to produce
-        2 highly mood-accurate songs for that image.
+        two highly mood-accurate songs for that image.
       </p>
 
       <p>
         Through testing across a diverse image corpus, I have found this
         system capable of accurately capturing a wide range of unique moods
         and aesthetics from pleasant to whimsical to punk. It is really fun
-        to play with. Please try your own images and see what comes up!
+        to play with - please try your own images and see what comes up!
       </p>
 
       <h3 className="about-heading">Optional LLM-Evaluation</h3>
 
       <p>
-        The default system does not use language models anywhere in the tag
-        extraction process, which can sometimes lead to slightly unusual
-        tags ranking high for certain images. If you’d like, you can turn on
+        By default, language models aren’t being used anywhere in the tag
+        extraction process. If you’d like, you can turn on
         LLM-judges for a run for slightly more refined tag lists.
       </p>
 
@@ -564,10 +679,9 @@ export const AboutSection = memo(function AboutSection({
       <p>
         These LLM-judges sort of “hone-in” the sometimes unpredictability of
         the tags from the embedding model and thus the unpredictability of
-        the generated tracks. However, you’ll notice I have the LLM-judges
-        set to off by default: it sometimes feels like there is some magic
-        contained within these otherwise seemingly unfitting tags, which
-        shine through in the audio. If you play around with this enough,
+        the generated tracks. But the reason I set these to default is because it sometimes feels like there is some magic
+        contained within these otherwise seemingly unfitting tags (which
+        shine through in the audio) - if you play around with this enough,
         you’ll know exactly what I mean!
       </p>
 
@@ -576,18 +690,18 @@ export const AboutSection = memo(function AboutSection({
       <p>
         While this project was optimized for and built around the SigLIP2
         algorithm, I also wanted to explore other embedding algorithms to
-        see how they compared: specifically, CLIP (SigLIP’s predecessor and
-        the OG joint embedding algorithm), ALIGN from Google (adaptation of
+        see how they compared. Specifically, CLIP (SigLIP’s predecessor and
+        the OG joint embedding algorithm from OpenAI), ALIGN from Google (adaptation of
         CLIP that uses EfficientNet for the image encoder and BERT for the
-        text encoder), and MetaCLIP from Meta (adaptation of CLIP that
-        favors more rare, specific concepts).
+        text encoder) and MetaCLIP from Meta (adaptation of CLIP that
+        favors more rare, specific concepts due to how it was trained).
       </p>
 
       <p>
         From my testing, CLIP and MetaCLIP felt like less refined versions
         of SigLIP, producing tracks that sort of had the right idea but
         ultimately tended to sound somewhat generic. ALIGN would
-        occasionally knock it out of the park, but I found it to be
+        occasionally knock it out of the park but I found it to be
         unreliable and inconsistent. I should stress again that this project
         was built around SigLIP2, so it’s very likely that a system like
         this could work well for any of these algorithms if optimized
@@ -613,7 +727,7 @@ export const AboutSection = memo(function AboutSection({
       <h3 className="about-heading">Genre Knob</h3>
 
       <p>
-        You may have noticed the “Genre Knob”. This is a fun addition that
+        You may have noticed the “Genre Knob”. This is a fun addition I came up with that
         appends a genre tag to the start of a tag list to essentially force
         the generated song to conform to a particular genre. You can select
         from one of 17 genres: rock, psychedelic rock, prog rock, math rock,
@@ -626,15 +740,22 @@ export const AboutSection = memo(function AboutSection({
 
       <p>
         The genre tag tends to overpower the nuances that the embedding
-        algorithm captures, so I’ve positioned this as an extra feature not
-        central to the app. It is really fun to mess around with though, and
-        the tracks that get produced are quite good, which is a testament to
-        the quality of the Suno model.
+        algorithm captures which is why this is positioned as an extra feature.
+        It is really fun to mess around with though, and the quality of the tracks
+        produced is a testament to how good the Suno model is.
+      </p>
+
+      <h3 className="about-heading">Vocals</h3>
+
+      <p>  
+        All prompts sent to Suno have “Instrumental=On”, but the app will occasionally produce songs with
+        vocals anyway. Since it’s the same model for generating songs both with and without vocals, the instrumental
+        option can’t be a hard toggle, only a strong suggestion.
       </p>
 
       <h3 className="about-heading">Suno v5.5</h3>
 
-      <p>
+      <p>  
         This app uses the Suno v5.5 model for audio generation. All rights to
         the underlying model belong to Suno; no ownership is claimed by this
         app.

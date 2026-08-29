@@ -1,4 +1,3 @@
-import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +8,7 @@ from uuid import uuid4
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -36,17 +35,41 @@ GIVE_UP_AFTER_SECONDS = 300
 SUNO_MODEL_VERSION = "V5_5"
 
 # Generated audio is downloaded here so playback doesn't depend on apiframe's
-# CDN links staying alive -- not a run history, just this run's working copy.
-# Wiped by DELETE /history (see below) before a new image can be picked.
-# Paths are relative to this file, so the server can be started from anywhere.
+# CDN links staying alive. Paths are relative to this file, so the server can
+# be started from anywhere.
 HISTORY_DIR = Path(__file__).parent / "history"
 AUDIO_DIR = HISTORY_DIR / "audio"
+# Uploaded (non-sample) images, persisted as soon as /tag succeeds so a
+# reloaded card's thumbnail is always the real photo -- never a placeholder.
+# Sample images need no copy here; they're already servable by name out of
+# TEST_IMAGES_DIR regardless of session.
+IMAGES_DIR = HISTORY_DIR / "images"
 
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 # The repo-root sample image set, served so the frontend's "select an image"
 # grid can offer them without the user needing their own file.
 TEST_IMAGES_DIR = Path(__file__).parent.parent / "test-images"
+
+# The whole session's list of runs, newest-appended, in-memory only -- reset
+# by any backend restart (including the --reload autoreload dev triggers).
+# One shared list, no per-visitor isolation: matches this phase's explicit
+# local-dev-only scope. Each record:
+#   {id, created_at, algorithm, image_source, tags, tag_scores, tagging,
+#    prompt, tracks}
+# where image_source is {"kind": "sample", "name": <str>} or
+# {"kind": "upload", "filename": <str>, "path": <str>} (path is relative to
+# HISTORY_DIR, servable through the /files mount below). `tracks` stays None
+# until /generate fills it in.
+SESSIONS: list[dict] = []
+MAX_SESSIONS = 20
+
+
+def find_session(run_id: str) -> dict | None:
+    """Looks up one session record by id, or None if it's gone (already
+    deleted, or the backend restarted since)."""
+    return next((record for record in SESSIONS if record["id"] == run_id), None)
 
 # The Next.js dev server is a different origin, which browsers block by default.
 app.add_middleware(
@@ -183,8 +206,9 @@ def save_audio(
 
     The MP3s are copied locally because apiframe's retention policy for its CDN
     links is undocumented, so pointing the player straight at `audioUrl` could
-    rot into a dead link. This is scratch space for the current run only -- no
-    JSONL row, no image copy -- wiped by `DELETE /history` before the next run.
+    rot into a dead link. These files, and the session's own record of them,
+    are removed either by this run's own `DELETE /history/{run_id}` or by a
+    bulk `DELETE /history`.
     """
     stamp = datetime.now(timezone.utc).astimezone()
     image_label = image_base_name(original_filename)
@@ -236,22 +260,72 @@ def save_audio(
     return tracks
 
 
+def _remove_file(path: Path) -> int | None:
+    """Deletes path if it exists and returns the bytes freed, else None."""
+    if not path.is_file():
+        return None
+    size = path.stat().st_size
+    path.unlink()
+    return size
+
+
 @app.delete("/history")
 def wipe_history() -> dict:
-    """Deletes every MP3 downloaded so far this run. Not reversible.
+    """Deletes every MP3 and persisted image downloaded so far this session,
+    and clears the in-memory session list. Not reversible.
 
-    Called by the frontend's Clear button before a new image can be picked --
-    the app only ever holds one image's run at a time, so this is a full wipe,
-    not a selective one.
+    Called by the frontend's Clear button. Unlike the per-run delete below,
+    this is a full wipe regardless of how many runs exist.
     """
     files_removed = 0
     bytes_freed = 0
 
-    for path in AUDIO_DIR.iterdir():
-        if path.is_file():
-            bytes_freed += path.stat().st_size
-            path.unlink()
+    for directory in (AUDIO_DIR, IMAGES_DIR):
+        for path in directory.iterdir():
+            freed = _remove_file(path)
+            if freed is not None:
+                bytes_freed += freed
+                files_removed += 1
+
+    SESSIONS.clear()
+
+    return {
+        "files_removed": files_removed,
+        "megabytes_freed": round(bytes_freed / 1_000_000, 1),
+    }
+
+
+@app.get("/history")
+def list_history() -> list[dict]:
+    """The whole session's runs, newest first -- lets a frontend page reload
+    rehydrate its cards, as long as the backend process itself hasn't
+    restarted (the in-memory tradeoff; see SESSIONS above)."""
+    return list(reversed(SESSIONS))
+
+
+@app.delete("/history/{run_id}")
+def delete_run(run_id: str) -> dict:
+    """Removes one run: its record, its MP3s, and its persisted image (if
+    it has one). 404 if the id isn't there -- already deleted, or the
+    backend restarted since."""
+    record = find_session(run_id)
+    if record is None:
+        raise HTTPException(404, f"No run with id {run_id!r}.")
+
+    files_removed = 0
+    bytes_freed = 0
+
+    paths = [HISTORY_DIR / track["audioFile"] for track in record["tracks"] or []]
+    if record["image_source"]["kind"] == "upload":
+        paths.append(HISTORY_DIR / record["image_source"]["path"])
+
+    for path in paths:
+        freed = _remove_file(path)
+        if freed is not None:
+            bytes_freed += freed
             files_removed += 1
+
+    SESSIONS.remove(record)
 
     return {
         "files_removed": files_removed,
@@ -327,11 +401,14 @@ def tag(
 ):
     """Runs the tagging half of the pipeline only: embedding scoring + the judge.
 
-    No Suno call and nothing saved to history -- this is the free, fast preview
-    that lets a user see (and the judge react to) an image's tags before they
-    commit to actually rendering a song. `/generate` below takes this response's
-    tags/tag_scores/tagging/prompt straight back so the judge never runs twice
-    for the same image.
+    No Suno call here -- this is the fast preview that lets a user see (and
+    the judge react to) an image's tags before they commit to actually
+    rendering a song. A session record is created either way, though: once
+    tagging succeeds, this run joins the session list (and, for an upload,
+    its image bytes are persisted) so the card exists and is deletable/
+    reloadable even before a song is ever generated. `/generate` below
+    takes just this run's `id` and looks the rest up off that record, so
+    the judge never runs twice for the same image.
 
     `judges=False` skips both Claude judge passes entirely (no call made,
     not just an ignored result) -- the frontend's LLM-judges toggle, for
@@ -353,7 +430,19 @@ def tag(
     cross-origin GET of the raw bytes to succeed under whatever CORS policy
     the browser is enforcing, which the frontend's own POSTs to this same
     endpoint don't require. Reading server-side sidesteps that entirely.
+
+    Rejects with 409 once the session already holds `MAX_SESSIONS` runs --
+    checked here, before any tagging work (including the heavy model
+    imports below) runs, rather than after paying for a tag extraction that
+    couldn't be kept anyway.
     """
+    if len(SESSIONS) >= MAX_SESSIONS:
+        raise HTTPException(
+            409,
+            f"This session already holds {MAX_SESSIONS} runs. "
+            "Delete one (or Clear) before starting another.",
+        )
+
     # Imported here rather than at module level so `import main` stays fast and
     # torch/anthropic are only loaded once an actual request needs them.
     from embedding_tagger import (
@@ -370,6 +459,8 @@ def tag(
     validate_genre(genre)
     validate_algorithm(algorithm)
 
+    run_id = uuid4().hex
+
     if sample_image and image is not None:
         raise HTTPException(
             status_code=400,
@@ -379,8 +470,19 @@ def tag(
         if sample_image not in known_sample_images():
             raise HTTPException(status_code=400, detail=f"Unknown sample image: {sample_image}")
         image_bytes = (TEST_IMAGES_DIR / sample_image).read_bytes()
+        image_source = {"kind": "sample", "name": sample_image}
     elif image is not None:
         image_bytes = read_image(image)
+        # Extension from the upload's content type (e.g. "image/jpeg" ->
+        # "jpeg") rather than the original filename, which could be missing
+        # its extension or lying about it. No collision handling needed --
+        # run_id is already unique.
+        ext = (image.content_type or "").removeprefix("image/") or "png"
+        image_source = {
+            "kind": "upload",
+            "filename": image.filename or "",
+            "path": f"images/{run_id}.{ext}",
+        }
     else:
         raise HTTPException(status_code=400, detail="Provide either an uploaded image or a sample_image filename.")
     # Computed once and reused below for the embedding-space plot -- tags_by_facet
@@ -454,49 +556,70 @@ def tag(
     # which is its documented home but made no audible difference in testing.
     prompt = ", ".join([prompt_term(genre), *tags] if genre else tags)
 
+    # Only reached once tagging has actually succeeded -- an uploaded image's
+    # bytes are written to disk, and the run is added to the session list,
+    # here rather than up front, so a request that errors out above leaves
+    # neither an orphaned file nor a half-formed record behind.
+    if image_source["kind"] == "upload":
+        (IMAGES_DIR / Path(image_source["path"]).name).write_bytes(image_bytes)
+
+    record = {
+        "id": run_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "algorithm": algorithm,
+        "image_source": image_source,
+        "tags": tags,
+        "tag_scores": tag_scores,
+        "tagging": tagging,
+        "prompt": prompt,
+        "tracks": None,
+    }
+    SESSIONS.append(record)
+
     return {
+        "id": run_id,
         "tags": tags,
         "tag_scores": tag_scores,
         "tagging": tagging,
         "prompt": prompt,
         "algorithm": algorithm,
+        "image_source": image_source,
     }
 
 
 @app.post("/generate")
-def generate(
-    image_filename: str = Form(""),
-    genre: str = "",
-    algorithm: str = "siglip",
-    tags: str = Form(...),
-    tag_scores: str = Form(...),
-    tagging: str = Form(...),
-    prompt: str = Form(...),
-):
-    """Renders a song from a `/tag` response the frontend already has.
+def generate(run_id: str):
+    """Renders a song for a run `/tag` already produced.
 
     Deliberately does no tagging of its own -- the image, tags, and judge
-    verdicts were already settled in `/tag`, so this step is Suno + audio
-    download only. `image_filename` is only needed for the audio naming
-    convention, not the image itself -- nothing here persists the image, so
-    unlike `/tag` there's no reason to make the frontend re-upload the whole
-    file just to read its name back. `algorithm` isn't used for anything
-    here except naming the downloaded file -- validating it doesn't need
-    embedding_tagger's heavy imports, so it's checked against the
-    lightweight `algorithms` module instead.
+    verdicts were already settled in `/tag` and are looked up here off the
+    session record, so this step is Suno + audio download only, and the
+    judge never runs twice for the same image. `run_id` is the only input;
+    everything else (algorithm, prompt, the original image's name for the
+    audio naming convention) comes off the stored record. 404s if the id
+    isn't in the session list -- already deleted, or the backend restarted
+    since `/tag` ran.
     """
-    validate_genre(genre)
-    validate_algorithm(algorithm)
+    record = find_session(run_id)
+    if record is None:
+        raise HTTPException(404, f"No run with id {run_id!r}. It may have been deleted, or the backend restarted since it was tagged.")
 
-    job = request_song(prompt)
-    tracks = save_audio(image_filename, job, algorithm)
+    image_source = record["image_source"]
+    original_filename = (
+        image_source["filename"] if image_source["kind"] == "upload" else image_source["name"]
+    )
+
+    job = request_song(record["prompt"])
+    tracks = save_audio(original_filename, job, record["algorithm"])
+    record["tracks"] = tracks
 
     return {
-        "algorithm": algorithm,
-        "tags": json.loads(tags),
-        "tag_scores": json.loads(tag_scores),
-        "tagging": json.loads(tagging),
-        "prompt": prompt,
+        "id": run_id,
+        "algorithm": record["algorithm"],
+        "tags": record["tags"],
+        "tag_scores": record["tag_scores"],
+        "tagging": record["tagging"],
+        "prompt": record["prompt"],
         "job_id": job["id"],
         "tracks": tracks,
     }

@@ -4,6 +4,10 @@
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 
+// Matches backend/main.py's MAX_SESSIONS -- the two aren't shared code, so
+// this has to be kept in sync by hand if the cap ever changes.
+export const MAX_CARDS = 20;
+
 export type Track = {
   audioFile: string;
 };
@@ -77,22 +81,39 @@ export type Tagging = {
   embedding?: Embedding;
 };
 
+// Where a run's image came from, and how to serve it back -- mirrors
+// backend/main.py's session record. A sample image is already servable by
+// name from /test-image-files regardless of session; an uploaded image's
+// bytes are persisted server-side under IMAGES_DIR as soon as /tag
+// succeeds, so `path` (relative to the backend's /files mount) always
+// resolves to the real photo, reload or not -- no placeholder case.
+export type ImageSource =
+  | { kind: "sample"; name: string }
+  | { kind: "upload"; filename: string; path: string };
+
 // What `POST /tag` returns: the tagging half of the pipeline only, no Suno
 // call yet. Held in state until the user commits with "Generate Songs", at
-// which point it's sent straight back to `POST /generate` so the judge
-// never has to run a second time for the same image.
+// which point only its `id` is sent back to `POST /generate` (the backend
+// looks the rest up off its own session record) so the judge never has to
+// run a second time for the same image.
 export type Analysis = {
+  id: string;
   tags: string[];
   tag_scores: Record<string, number>;
   tagging: Tagging;
   prompt: string;
   algorithm: string;
+  image_source: ImageSource;
 };
 
 // What `POST /generate` returns: Suno renders two takes per job and both are
 // kept -- they cost nothing extra, and one is usually the better listen.
+// `job_id` is optional because a card rehydrated from `GET /history` has
+// `tracks` (the session record keeps those) but no `job_id` -- the backend
+// never stores the Suno job id past the request that made it, and nothing
+// in the frontend reads `job_id` today.
 export type GeneratedSong = {
-  job_id: string;
+  job_id?: string;
   tracks: Track[];
 };
 
@@ -106,6 +127,96 @@ export type RunResult = {
   generated?: GeneratedSong;
   generateError?: string;
 };
+
+// Whether a card has async work of its own in flight -- still tagging, or
+// mid-generate. Gates things like the delete button and the "pin this card
+// open" rule, each of which needs this exact check.
+export function isCardBusy(result: RunResult): boolean {
+  return result.status === "loading" || Boolean(result.generating);
+}
+
+// One entry in the session's list of up to 20 runs -- the frontend's shape
+// for a backend session record (GET /history's items, and what a `/tag`
+// success gets folded into). `result` is a `RunResult` reused as-is: it
+// already models one card's in-flight/settled state (loading/ready/error,
+// then optionally generating/generated/generateError) whether the card
+// arrived fresh from `/tag` this session or was rehydrated from history.
+//
+// `imageSource` is nullable only for the brief window between starting a run
+// and `/tag` actually responding for an *uploaded* image: the backend hasn't
+// assigned the run its id (and therefore its persisted image path) yet, and
+// deliberately no client-side object URL stands in for it in the meantime
+// (see startRun in page.tsx) -- so there's simply no thumbnail to show yet,
+// never a placeholder one. A sample image needs no such gap; it's already
+// knowable client-side. Once `/tag` resolves, it's always set (that's the
+// "no placeholder case remains" guarantee) for the rest of the card's life,
+// reload included. The preview URL itself is never stored -- it's always
+// derived on demand via `previewUrlFor`, so there's nothing to keep in sync.
+export type Card = {
+  id: string;
+  algorithm: string;
+  createdAt: string;
+  imageSource: ImageSource | null;
+  result: RunResult;
+};
+
+// Builds a card's image URL straight off its `ImageSource` -- no
+// client-side object-URL lifecycle needed even for a card created in the
+// current tab, since the backend always has a servable copy the moment
+// `/tag` returns (an upload's bytes are persisted under IMAGES_DIR; a
+// sample was already servable by name).
+export function previewUrlFor(imageSource: ImageSource): string {
+  return imageSource.kind === "upload"
+    ? fileUrl(imageSource.path)
+    : `${API_URL}/test-image-files/${encodeURIComponent(imageSource.name)}`;
+}
+
+// What `GET /history` returns per entry -- the backend's own session record
+// (main.py's SESSIONS), before it's reshaped into a `Card`. Same shape as an
+// `Analysis` (id/tags/tag_scores/tagging/prompt/algorithm/image_source) plus
+// the two fields only the persisted record carries.
+export type SessionRecord = Analysis & {
+  created_at: string;
+  tracks: Track[] | null;
+};
+
+// Reshapes one history record into a Card -- used to hydrate `cards` from
+// `GET /history` on mount, so a reload restores every run that had already
+// reached `/tag`, tracks included where a song was already generated.
+export function cardFromRecord(record: SessionRecord): Card {
+  return {
+    id: record.id,
+    algorithm: record.algorithm,
+    createdAt: record.created_at,
+    imageSource: record.image_source,
+    result: {
+      status: "ready",
+      analysis: record,
+      generated: record.tracks ? { tracks: record.tracks } : undefined,
+    },
+  };
+}
+
+// Builds a fresh card straight from a `/tag` success response -- no
+// `tracks` yet (nothing has been generated for it). `createdAt` is set to
+// now rather than echoed from the backend: `/tag`'s response doesn't carry
+// a timestamp (only the session record kept server-side does).
+export function cardFromAnalysis(analysis: Analysis): Card {
+  return {
+    id: analysis.id,
+    algorithm: analysis.algorithm,
+    createdAt: new Date().toISOString(),
+    imageSource: analysis.image_source,
+    result: { status: "ready", analysis },
+  };
+}
+
+// `POST /generate`'s whole request now: just the run id to fill in tracks
+// for -- the backend looks the rest (prompt, algorithm, image source) up
+// off its own session record, so there's no FormData/body to build here
+// the way the old tags/tag_scores/tagging/prompt echo needed.
+export const generateUrl = (runId: string) =>
+  `${API_URL}/generate?run_id=${encodeURIComponent(runId)}`;
 
 // Which of a judge pass's verdicts actually get shown as a dropped tag, and
 // what to say about each -- shared data-shaping for JudgeReviewSection.

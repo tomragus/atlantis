@@ -1,12 +1,13 @@
 """The embedding algorithms the tagger can run, and the picker's copy for each.
 
 Kept out of `embedding_tagger.py` deliberately, mirroring that file's own split from
-`genres.py`: `main.py`'s `/generate` route needs to validate which algorithm produced
-the tags it's saving to history, but never needs to load a single model to do that.
-Keeping this list and its validator here, with no heavy imports, means validating an
-`algorithm` string doesn't drag torch/transformers into a route that has no other
-reason to import them -- the same "import main stays fast" reasoning `main.py`
-already applies to its own deferred imports.
+`genres.py`: `main.py`'s `/tag` route needs to validate the requested algorithm before
+tagging (the validated value is then stored on the session record and reused as-is by
+`/generate`), but never needs to load a single model to do that. Keeping this list and
+its validator here, with no heavy imports, means validating an `algorithm` string
+doesn't drag torch/transformers into a route that has no other reason to import them
+-- the same "import main stays fast" reasoning `main.py` already applies to its own
+deferred imports.
 """
 
 from fastapi import HTTPException
