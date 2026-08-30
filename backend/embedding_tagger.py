@@ -17,9 +17,11 @@ has a trained logit_scale/logit_bias to turn cosine similarity into one, so the 
 three score with raw cosine similarity on their own native scale.
 """
 
+import hashlib
 import io
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 from PIL import Image
@@ -39,6 +41,13 @@ HF_MODEL_IDS = {
     "align": "kakaobrain/align-base",
     "metaclip": "facebook/metaclip-b32-400m",
 }
+
+# Where each algorithm's embedded vocabulary gets cached to disk (see
+# _embed_vocabulary below) -- baked into the Docker image by the same build
+# step that already bakes in model weights, so a cold start never pays for
+# re-embedding 261 words x 4 templates through the model. Generated, not
+# source: gitignored and dockerignored, like backend/history/.
+VOCAB_CACHE_DIR = Path(__file__).parent / "vocab_cache"
 
 
 @dataclass
@@ -70,6 +79,16 @@ def _pick_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _vocabulary_cache_signature(algorithm: str) -> str:
+    """Fingerprints everything that determines this algorithm's vocabulary
+    vectors -- the checkpoint, the words, and the phrasing templates -- so a
+    cache built against an older vocabulary.py (or a swapped checkpoint) is
+    detected and rebuilt rather than silently served as if it still matched.
+    """
+    payload = repr((HF_MODEL_IDS[algorithm], ADJECTIVES, TEMPLATES)).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _embed_vocabulary(algorithm: str) -> dict[str, torch.Tensor]:
     """Embeds every adjective once and returns the vectors split back per facet.
 
@@ -77,7 +96,23 @@ def _embed_vocabulary(algorithm: str) -> dict[str, torch.Tensor]:
     phrasing carries the quirks of its own wording, and the mean cancels much of
     that out. One batch per template rather than per facet per template is the same
     arithmetic in a quarter of the forward passes.
+
+    That's still 261 words x 4 templates = 1044 text encodings, done fresh
+    every time this ran -- the actual bottleneck behind a cold start's
+    "loading" delay, since it's bundled into the same one-time step as the
+    model weights themselves but does far more work than embedding any one
+    user's image ever does. The result never depends on an image, so it's
+    cached to disk the first time it's computed and just read back after
+    that (see VOCAB_CACHE_DIR above).
     """
+    cache_path = VOCAB_CACHE_DIR / f"{algorithm}.pt"
+    signature = _vocabulary_cache_signature(algorithm)
+
+    if cache_path.is_file():
+        cached = torch.load(cache_path, weights_only=True)
+        if cached.get("signature") == signature:
+            return cached["vectors"]
+
     state = _state[algorithm]
     facets = list(ADJECTIVES)
     words = [word for facet in facets for word in ADJECTIVES[facet]]
@@ -104,6 +139,10 @@ def _embed_vocabulary(algorithm: str) -> dict[str, torch.Tensor]:
         end = start + len(ADJECTIVES[facet])
         vectors_by_facet[facet] = averaged[start:end]
         start = end
+
+    VOCAB_CACHE_DIR.mkdir(exist_ok=True)
+    torch.save({"signature": signature, "vectors": vectors_by_facet}, cache_path)
+
     return vectors_by_facet
 
 

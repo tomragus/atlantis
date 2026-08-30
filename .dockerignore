@@ -1,0 +1,38 @@
+# Secrets -- never end up in a build context or an image layer.
+.env
+.env.*
+backend/.env
+backend/.env.*
+
+# Node / Next.js -- stage 1 installs and builds fresh inside the container.
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Python
+backend/.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local-only generated data, never baked into the image as-is -- the build's
+# own bake step (see Dockerfile) regenerates vocab_cache/ fresh so it's
+# guaranteed to match the weights/vocabulary baked into this specific image,
+# rather than whatever happened to exist on the host at build time.
+backend/history/
+backend/vocab_cache/
+
+# Git and editor/OS cruft
+.git/
+.DS_Store
+
+# Local planning/guidance docs -- not meant to ship inside the image.
+CLAUDE.md
+DEPLOYMENT.md
+PLAN-phase1-history.md
+PLAN-phase2-deployment.md
+REPORT.md
+
+# Misc repo-root files not needed at runtime.
+ideagram.jpg
+musicgen-experiment/

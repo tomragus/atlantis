@@ -1,6 +1,8 @@
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +22,48 @@ from genres import GENRES, prompt_term, validate_genre
 # so os.environ can see them below.
 load_dotenv()
 
-app = FastAPI(title="Ideagram Studio")
+# Next's static export output (`next build` with output: "export" in
+# next.config.ts) -- present in the Docker image (see Dockerfile), absent in
+# local dev, where the frontend runs as its own `npm run dev` process
+# instead. Doubles here as the signal for "is this the deployed container,"
+# since that's exactly when eagerly preloading below is worth its cost.
+FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "out"
+
+
+def _preload_algorithm(algorithm: str) -> None:
+    """Warms one embedding algorithm in the background at startup, so a
+    visitor's first /tag call for it doesn't pay for loading it mid-request.
+
+    Runs off the request path, in its own thread rather than blocking
+    startup -- Cloud Run's own startup check shouldn't have to wait for any
+    of these to finish. embedding_tagger's per-algorithm lock already makes
+    this safe to race against a real request that gets to this algorithm
+    first, and against the other three algorithms' own preload threads,
+    which never touch each other's state.
+    """
+    from embedding_tagger import _load
+
+    try:
+        _load(algorithm)
+    except Exception as exc:
+        print(f"background preload of {algorithm!r} failed: {exc}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Only in the deployed container -- local dev's `--reload` restarts
+    # shouldn't eagerly reload every algorithm on every file save. One
+    # thread per algorithm, all four started together, rather than one
+    # thread looping through them -- so a cold start's total load time is
+    # bounded by however long the slowest single algorithm takes, not the
+    # sum of all four.
+    if FRONTEND_DIST.is_dir():
+        for algorithm in ALGORITHMS:
+            threading.Thread(target=_preload_algorithm, args=(algorithm,), daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Ideagram Studio", lifespan=lifespan)
 
 # Pillow opens more than these, but the frontend's file picker and the tagger are
 # only exercised against the common web formats, so the rest are turned away.
@@ -81,12 +124,18 @@ app.add_middleware(
 )
 
 
-@app.get("/")
+@app.get("/api/health")
 def health():
-    """Confirms the server is up and which keys were loaded."""
+    """Confirms the server is up and which keys were loaded.
+
+    Not at bare "/" -- in production that path serves the built frontend
+    (see the conditional mount at the bottom of this file), so the health
+    check needs its own path to avoid colliding with it.
+    """
     return {
         "status": "ok",
         "apiframe_key_loaded": bool(os.environ.get("APIFRAME_API_KEY")),
+        "anthropic_key_loaded": bool(os.environ.get("ANTHROPIC_API_KEY")),
     }
 
 
@@ -633,3 +682,11 @@ app.mount("/files", StaticFiles(directory=HISTORY_DIR), name="files")
 app.mount(
     "/test-image-files", StaticFiles(directory=TEST_IMAGES_DIR), name="test-image-files"
 )
+
+# Serves the built frontend at "/", registered last so every API route above
+# still matches first -- StaticFiles(html=True) only handles requests none of
+# those routes claimed. Only present when FRONTEND_DIST actually exists (the
+# deployed container), so local dev without a `next build` in hand is
+# unaffected and keeps using the two-process (`npm run dev` + uvicorn) setup.
+if FRONTEND_DIST.is_dir():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
