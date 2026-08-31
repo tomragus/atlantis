@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Standalone Node/CommonJS dev tooling, not part of the Next app --
+    // the TS/ESM-oriented rules above don't apply to it.
+    "dev-proxy.js",
   ]),
 ]);
 

@@ -9,7 +9,7 @@ export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000
 export const MAX_CARDS = 20;
 
 export type Track = {
-  audioFile: string;
+  url: string;
 };
 
 export type FacetTag = {
@@ -84,12 +84,12 @@ export type Tagging = {
 // Where a run's image came from, and how to serve it back -- mirrors
 // backend/main.py's session record. A sample image is already servable by
 // name from /test-image-files regardless of session; an uploaded image's
-// bytes are persisted server-side under IMAGES_DIR as soon as /tag
-// succeeds, so `path` (relative to the backend's /files mount) always
-// resolves to the real photo, reload or not -- no placeholder case.
+// bytes are persisted server-side (through storage.py) as soon as /tag
+// succeeds, so `url` always resolves to the real photo, reload or not -- no
+// placeholder case.
 export type ImageSource =
   | { kind: "sample"; name: string }
-  | { kind: "upload"; filename: string; path: string };
+  | { kind: "upload"; filename: string; url: string };
 
 // What `POST /tag` returns: the tagging half of the pipeline only, no Suno
 // call yet. Held in state until the user commits with "Generate Songs", at
@@ -142,15 +142,14 @@ export function isCardBusy(result: RunResult): boolean {
 // then optionally generating/generated/generateError) whether the card
 // arrived fresh from `/tag` this session or was rehydrated from history.
 //
-// `imageSource` is nullable only for the brief window between starting a run
-// and `/tag` actually responding for an *uploaded* image: the backend hasn't
-// assigned the run its id (and therefore its persisted image path) yet, and
-// deliberately no client-side object URL stands in for it in the meantime
-// (see startRun in page.tsx) -- so there's simply no thumbnail to show yet,
-// never a placeholder one. A sample image needs no such gap; it's already
-// knowable client-side. Once `/tag` resolves, it's always set (that's the
-// "no placeholder case remains" guarantee) for the rest of the card's life,
-// reload included. The preview URL itself is never stored -- it's always
+// `imageSource` stays `null` only if a run is somehow started with neither a
+// file nor a sample selected (startRun's own `hasImage` guard should already
+// rule this out). For the ordinary brief window between starting a run and
+// `/tag` actually responding, both cases have something to show immediately:
+// a sample image's URL is already knowable client-side, and an upload gets a
+// local object URL (startRun, revoked once the real one arrives) standing in
+// until the backend hands back the persisted, servable photo that replaces
+// it entirely. The preview URL itself is never stored here -- it's always
 // derived on demand via `previewUrlFor`, so there's nothing to keep in sync.
 export type Card = {
   id: string;
@@ -160,14 +159,14 @@ export type Card = {
   result: RunResult;
 };
 
-// Builds a card's image URL straight off its `ImageSource` -- no
-// client-side object-URL lifecycle needed even for a card created in the
-// current tab, since the backend always has a servable copy the moment
-// `/tag` returns (an upload's bytes are persisted under IMAGES_DIR; a
-// sample was already servable by name).
+// Builds a card's image URL straight off its `ImageSource` -- works
+// identically whether that's a sample's static path, an upload's real
+// backend-served URL once `/tag` has returned (persisted through
+// storage.py), or (see startRun in page.tsx) an upload's temporary local
+// object URL standing in before that.
 export function previewUrlFor(imageSource: ImageSource): string {
   return imageSource.kind === "upload"
-    ? fileUrl(imageSource.path)
+    ? imageSource.url
     : `${API_URL}/test-image-files/${encodeURIComponent(imageSource.name)}`;
 }
 
@@ -266,24 +265,21 @@ export const PLOT_HEIGHT = 300;
 export const PLOT_MARGIN = 30;
 export const TOOLTIP_HEIGHT = 34;
 
-// Downloaded MP3s are served by the backend out of its (non-history) audio
-// folder. Filenames contain spaces, `&` and apostrophes, so each path
-// segment is escaped separately -- encoding the whole path would eat the
-// `/` too.
-export const fileUrl = (path: string) =>
-  `${API_URL}/files/${path.split("/").map(encodeURIComponent).join("/")}`;
-
 // Shared by every mutating call (wipe run, extract tags, generate song):
 // fetch, parse JSON, and normalize both an API error (the response body's
 // `detail`) and a network failure into one `Error` with a message fit to
 // show the user -- so each call site's catch block is just `setError`.
+// `credentials: "include"` on every call: the backend's session cookie is
+// what tells two visitors apart, and it round-trips across the frontend's
+// :3000 / backend's :8000 origins in local dev only if every request opts
+// in explicitly.
 export async function apiRequest(
   url: string,
   options: RequestInit,
   fallbackMessage: string,
 ) {
   try {
-    const response = await fetch(url, options);
+    const response = await fetch(url, { ...options, credentials: "include" });
     const data = await response.json();
     if (!response.ok) {
       throw new Error(data.detail ?? fallbackMessage);

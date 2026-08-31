@@ -1058,3 +1058,24 @@ h2.about-heading {
 h3.about-heading {
   font-size: 0.98rem;
 }
+
+.about-attribution {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--line-on-dark);
+  color: var(--ink-on-dark);
+}
+
+.about-linkedin {
+  display: inline-flex;
+  color: var(--ink-on-dark);
+  transition: color 0.15s ease;
+}
+
+.about-linkedin:hover,
+.about-linkedin:focus-visible {
+  color: var(--accent-teal-bright);
+}

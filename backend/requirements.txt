@@ -5,6 +5,10 @@ python-dotenv
 requests
 anthropic
 
+# Per-visitor session/audio/image persistence when SESSION_BUCKET is set
+# (see storage.py); a no-op locally, but the import still needs to resolve.
+google-cloud-storage
+
 # The multi-algorithm tagger, which turns an uploaded image into the music prompt.
 # torch is large (~700MB installed); each algorithm's weights (SigLIP/CLIP/ALIGN/
 # MetaCLIP ~350-600MB) download lazily on that algorithm's first use.

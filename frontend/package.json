@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:proxied": "NEXT_PUBLIC_API_URL= next dev",
+    "dev:proxy": "node dev-proxy.js",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
@@ -22,6 +24,7 @@
     "@types/react-katex": "^3.0.4",
     "eslint": "^9",
     "eslint-config-next": "16.2.11",
+    "http-proxy": "^1.18.1",
     "typescript": "^5"
   }
 }

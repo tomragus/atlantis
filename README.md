@@ -72,17 +72,26 @@ cp .env.example .env   # then paste your APIFRAME_API_KEY into .env
 uvicorn main:app --reload
 ```
 
-Runs on `http://127.0.0.1:8000`. `GET /` reports whether the key loaded.
+Runs on `http://127.0.0.1:8000`. `GET /api/health` reports whether each key loaded.
 
 ### Frontend
 
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev:proxied   # not plain `npm run dev` -- see below
+npm run dev:proxy     # in a second terminal
 ```
 
-Runs on `http://localhost:3000` and talks to the backend at
-`http://127.0.0.1:8000` by default (override with `NEXT_PUBLIC_API_URL`).
+Open **`http://127.0.0.1:3001`** (the proxy), not `:3000` directly. The app
+now identifies each visitor with a `session_id` cookie, and the browser
+treats `localhost:3000`/`127.0.0.1:8000` as different sites -- a cookie set
+by one is never sent back to the other, so every request looks like a brand
+new, empty visitor and `/generate` 404s on any run you just tagged.
+`dev-proxy.js` puts both servers behind one origin, the same way production
+already does (one process serving frontend + API together). Plain
+`npm run dev` still works for frontend-only changes that never call the
+backend, but skips the proxy and inherits that broken-cookie behavior.
 
-Both servers need to be running for the app to work.
+Both the backend and (both halves of) the frontend need to be running for
+the full app to work.

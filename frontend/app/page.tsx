@@ -20,6 +20,10 @@ import {
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
+  // File inputs are uncontrolled in React -- setting `file` back to null
+  // doesn't clear the native input's displayed filename. Bumping this key
+  // (handleClear) remounts it instead, which does.
+  const [fileInputKey, setFileInputKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [genres, setGenres] = useState<string[]>([]);
@@ -100,26 +104,27 @@ export default function Home() {
       setApiDown(true);
     };
 
-    fetch(`${API_URL}/genres`)
+    fetch(`${API_URL}/genres`, { credentials: "include" })
       .then((response) => response.json())
       .then(setGenres)
       .catch(offline("Could not load the genre list."));
 
-    fetch(`${API_URL}/algorithms`)
+    fetch(`${API_URL}/algorithms`, { credentials: "include" })
       .then((response) => response.json())
       .then(setAlgorithms)
       .catch(offline("Could not load the algorithm list."));
 
-    fetch(`${API_URL}/test-images`)
+    fetch(`${API_URL}/test-images`, { credentials: "include" })
       .then((response) => response.json())
       .then(setSampleImages)
       .catch(offline("Could not load the sample image list."));
 
-    // Rehydrates every run this session already reached /tag for -- as
-    // long as the backend process itself hasn't restarted since (the
-    // in-memory tradeoff; see main.py's SESSIONS). A fresh backend process
-    // just returns an empty list, so this is a no-op on a first run.
-    fetch(`${API_URL}/history`)
+    // Rehydrates every run this visitor already reached /tag for -- as long
+    // as this process still has (or storage can recover) their session. A
+    // fresh visitor just gets an empty list, so this is a no-op on a first run.
+    // credentials: "include" is what lets the session cookie set on an
+    // earlier response come back here, across the :3000/:8000 origins.
+    fetch(`${API_URL}/history`, { credentials: "include" })
       .then((response) => response.json())
       .then((records: SessionRecord[]) => setCards(records.map(cardFromRecord)))
       .catch(offline("Could not load run history."));
@@ -164,6 +169,7 @@ export default function Home() {
         "Could not clear the run.",
       );
       setFile(null);
+      setFileInputKey((key) => key + 1);
       setSelectedSample(null);
       setCards([]);
       setExpanded({});
@@ -186,10 +192,9 @@ export default function Home() {
   // status is "loading") so the in-flight run is visible in the list right
   // away. For a sample image its imageSource is already knowable
   // client-side, so RunCard can derive its preview URL immediately; for an
-  // upload imageSource stays null until /tag responds -- deliberately no
-  // client-side object URL standing in for a thumbnail in the meantime --
-  // and the real, backend-served photo appears the moment /tag actually
-  // succeeds and replaces this entry.
+  // upload, a local object URL (createObjectURL, revoked below once the
+  // real one arrives) stands in until /tag responds, then the real,
+  // backend-served photo replaces this entry entirely.
   //
   // The placeholder's id is generated fresh per call (never a shared
   // constant): if /tag fails, the placeholder stays in the list as an
@@ -203,12 +208,19 @@ export default function Home() {
     setError(null);
     setNotice(null);
     const pendingId = `pending-${crypto.randomUUID()}`;
+    // Only for an upload; a sample image's URL is already knowable without
+    // reading the file at all.
+    const uploadPreviewUrl = file ? URL.createObjectURL(file) : null;
     setCards((prev) => [
       {
         id: pendingId,
         algorithm,
         createdAt: new Date().toISOString(),
-        imageSource: selectedSample ? { kind: "sample", name: selectedSample } : null,
+        imageSource: selectedSample
+          ? { kind: "sample", name: selectedSample }
+          : uploadPreviewUrl
+            ? { kind: "upload", filename: file!.name, url: uploadPreviewUrl }
+            : null,
         result: { status: "loading" },
       },
       ...prev,
@@ -237,6 +249,9 @@ export default function Home() {
       .then((data: Analysis) => {
         const card = cardFromAnalysis(data);
         setCards((prev) => prev.map((c) => (c.id === pendingId ? card : c)));
+        // The backend-served photo has replaced it in the card above, so
+        // the local preview is no longer referenced anywhere -- free it.
+        if (uploadPreviewUrl) URL.revokeObjectURL(uploadPreviewUrl);
       })
       .catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
@@ -391,6 +406,7 @@ export default function Home() {
         <p className="note">Uses the Suno v5.5 model</p>
 
         <input
+          key={fileInputKey}
           type="file"
           accept="image/*"
           onChange={(event) => {

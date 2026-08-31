@@ -1,4 +1,5 @@
 import os
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -10,13 +11,14 @@ from uuid import uuid4
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # Safe to import at module level: plain strings and a lookup, no heavy dependencies.
 from algorithms import ALGORITHMS, ALGORITHM_INFO, validate_algorithm
 from genres import GENRES, prompt_term, validate_genre
+import storage
 
 # Reads backend/.env and puts the keys into the process environment,
 # so os.environ can see them below.
@@ -77,51 +79,114 @@ GIVE_UP_AFTER_SECONDS = 300
 # under us. Options: V4, V4_5, V4_5ALL, V4_5PLUS, V5, V5_5. All cost 11 credits.
 SUNO_MODEL_VERSION = "V5_5"
 
-# Generated audio is downloaded here so playback doesn't depend on apiframe's
-# CDN links staying alive. Paths are relative to this file, so the server can
-# be started from anywhere.
+# Generated audio is downloaded here (via storage.py) so playback doesn't
+# depend on apiframe's CDN links staying alive, and so local dev needs no GCS
+# bucket. Path is relative to this file, so the server can be started from
+# anywhere. Only used directly here for the /files mount below -- storage.py
+# owns the per-token layout underneath it.
 HISTORY_DIR = Path(__file__).parent / "history"
-AUDIO_DIR = HISTORY_DIR / "audio"
-# Uploaded (non-sample) images, persisted as soon as /tag succeeds so a
-# reloaded card's thumbnail is always the real photo -- never a placeholder.
-# Sample images need no copy here; they're already servable by name out of
-# TEST_IMAGES_DIR regardless of session.
-IMAGES_DIR = HISTORY_DIR / "images"
-
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 # The repo-root sample image set, served so the frontend's "select an image"
 # grid can offer them without the user needing their own file.
 TEST_IMAGES_DIR = Path(__file__).parent.parent / "test-images"
 
-# The whole session's list of runs, newest-appended, in-memory only -- reset
-# by any backend restart (including the --reload autoreload dev triggers).
-# One shared list, no per-visitor isolation: matches this phase's explicit
-# local-dev-only scope. Each record:
+MAX_SESSIONS = 20
+
+# One run list per visitor, in memory for the life of this process --
+# recovered from storage on first touch per token (see _session_for), since
+# a Cloud Run instance recycle (idle scale-to-zero, a redeploy, a crash)
+# drops this dict the same way a restart drops SESSIONS did before per-visitor
+# isolation existed. Each record:
 #   {id, created_at, algorithm, image_source, tags, tag_scores, tagging,
 #    prompt, tracks}
 # where image_source is {"kind": "sample", "name": <str>} or
-# {"kind": "upload", "filename": <str>, "path": <str>} (path is relative to
-# HISTORY_DIR, servable through the /files mount below). `tracks` stays None
-# until /generate fills it in.
-SESSIONS: list[dict] = []
-MAX_SESSIONS = 20
+# {"kind": "upload", "filename": <str>, "ref": <str>, "url": <str>} (ref is
+# what storage.py's delete_file takes back; url is what the frontend plays/
+# displays directly). `tracks` stays None until /generate fills it in.
+_sessions: dict[str, list[dict]] = {}
 
 
-def find_session(run_id: str) -> dict | None:
+def _session_for(request: Request) -> tuple[str, list[dict]]:
+    """This visitor's token and run list. The token itself was already
+    resolved by session_cookie_middleware before any route runs; the list is
+    recovered from storage the first time this process sees this token, then
+    cached here for the rest of the process's life.
+    """
+    token = request.state.session_token
+    if token not in _sessions:
+        _sessions[token] = storage.load_session_records(token) or []
+    return token, _sessions[token]
+
+
+def find_session(records: list[dict], run_id: str) -> dict | None:
     """Looks up one session record by id, or None if it's gone (already
-    deleted, or the backend restarted since)."""
-    return next((record for record in SESSIONS if record["id"] == run_id), None)
+    deleted, or the backend restarted since and storage had nothing for it)."""
+    return next((record for record in records if record["id"] == run_id), None)
+
 
 # The Next.js dev server is a different origin, which browsers block by default.
+# Added before session_cookie_middleware below so that middleware ends up the
+# outer layer at runtime (Starlette's add_middleware stacks the most
+# recently added one outermost) -- every request resolves its session token
+# first, CORS headers get applied around the actual route handling underneath.
 app.add_middleware(
     CORSMiddleware,
     # Both spellings: the browser treats them as different origins.
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
+    # Lets the session cookie round-trip cross-origin in local dev -- without
+    # this the browser drops Set-Cookie on the response and never sends the
+    # cookie back, so every request would look like a brand new visitor.
+    allow_credentials=True,
 )
+
+SESSION_COOKIE = "session_id"
+# 30 days -- matches the GCS bucket's own age-based lifecycle rule, so the
+# cookie and the visitor's persisted data expire together rather than the
+# cookie dropping first and orphaning data nothing can reach anymore.
+SESSION_COOKIE_MAX_AGE = 60 * 60 * 24 * 30
+
+
+@app.middleware("http")
+async def session_cookie_middleware(request: Request, call_next):
+    """Resolves this visitor's session token before the route runs, minting
+    one when the request carries none, and sets it on every response -- an
+    error alike a success. A cookie set through a route's own Response
+    parameter only applies on the success path in FastAPI; raising
+    HTTPException discards it silently, so middleware is what makes the
+    cookie stick no matter how the request ends.
+    """
+    token = request.cookies.get(SESSION_COOKIE)
+    minted = token is None
+    if minted:
+        token = secrets.token_urlsafe(32)
+    request.state.session_token = token
+
+    response = await call_next(request)
+
+    if minted:
+        response.set_cookie(
+            SESSION_COOKIE,
+            token,
+            max_age=SESSION_COOKIE_MAX_AGE,
+            httponly=True,
+            # "none" rather than "lax": unlike the sibling project (whose Vite
+            # dev server proxies /api, making every request same-origin from
+            # the browser's point of view), this frontend calls the backend
+            # directly cross-origin in local dev (:3000 -> :8000). A Lax
+            # cookie is never attached to a cross-site fetch/XHR (only to a
+            # top-level navigation), so it would round-trip on the very first
+            # response and then silently stop being sent on every request
+            # after -- confirmed live: every reload looked like a brand new,
+            # empty session. SameSite=None requires Secure, which still works
+            # here since Chromium/Firefox/Safari all treat 127.0.0.1/localhost
+            # as a potentially-trustworthy origin even over plain HTTP.
+            samesite="none",
+            secure=True,
+        )
+    return response
 
 
 @app.get("/api/health")
@@ -247,28 +312,26 @@ def audio_filename(image_name: str, algorithm: str, take: int, stamp: datetime) 
 
 
 def save_audio(
+    token: str,
+    run_id: str,
     original_filename: str | None,
     job: dict,
     algorithm: str,
 ) -> list[dict]:
-    """Downloads every take Suno rendered for this run to local disk.
+    """Downloads every take Suno rendered for this run through storage.py.
 
-    The MP3s are copied locally because apiframe's retention policy for its CDN
-    links is undocumented, so pointing the player straight at `audioUrl` could
-    rot into a dead link. These files, and the session's own record of them,
-    are removed either by this run's own `DELETE /history/{run_id}` or by a
-    bulk `DELETE /history`.
+    The MP3s are copied off apiframe's CDN because its retention policy for
+    those links is undocumented, so pointing the player straight at
+    `audioUrl` could rot into a dead link. These files, and the session's own
+    record of them, are removed either by this run's own
+    `DELETE /history/{run_id}` or by a bulk `DELETE /history`.
     """
     stamp = datetime.now(timezone.utc).astimezone()
     image_label = image_base_name(original_filename)
 
     # Suno renders two takes per job and both are kept: they cost nothing extra,
     # and one is usually the better listen. The two downloads are independent
-    # I/O with no shared state, so fetch them concurrently rather than waiting
-    # on one before starting the next; the collision-checking/write loop below
-    # stays sequential (and in take order) since it does touch shared state
-    # (the filesystem, and `destination.exists()` checks against files this
-    # same call is writing).
+    # I/O with no shared state, so fetch them concurrently.
     raw_tracks = job["result"]["tracks"]
     with ThreadPoolExecutor(max_workers=max(len(raw_tracks), 1)) as executor:
         downloads = list(
@@ -282,22 +345,19 @@ def save_audio(
             # and recorded as a success, surfacing later as a track that won't play.
             continue
 
+        # Nested under this run's own id, so two takes named alike (same image,
+        # algorithm, and take number, generated the same day) can never collide
+        # the way they could under the old single flat AUDIO_DIR -- run_id is
+        # already unique, so no separate collision check is needed here.
         audio_name = audio_filename(image_label, algorithm, index + 1, stamp)
-        destination = AUDIO_DIR / audio_name
-        if destination.exists():
-            # Date-only granularity means the same image name, algorithm, and take
-            # collide easily within a single day, so this fallback is the normal
-            # case for a second run of the same image on the same day, not just a
-            # rare coincidence.
-            audio_name = f"{destination.stem}_{uuid4().hex[:4]}.mp3"
-            destination = AUDIO_DIR / audio_name
-        destination.write_bytes(download.content)
+        ref = storage.put_file(token, f"audio/{run_id}/{audio_name}", download.content)
         tracks.append(
             {
                 "title": track["title"],
                 "duration": track["duration"],
                 "audioUrl": track["audioUrl"],
-                "audioFile": f"audio/{audio_name}",
+                "ref": ref,
+                "url": storage.playback_url(ref),
             }
         )
 
@@ -309,34 +369,30 @@ def save_audio(
     return tracks
 
 
-def _remove_file(path: Path) -> int | None:
-    """Deletes path if it exists and returns the bytes freed, else None."""
-    if not path.is_file():
-        return None
-    size = path.stat().st_size
-    path.unlink()
-    return size
-
-
 @app.delete("/history")
-def wipe_history() -> dict:
-    """Deletes every MP3 and persisted image downloaded so far this session,
-    and clears the in-memory session list. Not reversible.
+def wipe_history(request: Request) -> dict:
+    """Deletes every MP3 and persisted image this visitor has downloaded so
+    far, and clears their run list. Not reversible.
 
     Called by the frontend's Clear button. Unlike the per-run delete below,
     this is a full wipe regardless of how many runs exist.
     """
+    token, records = _session_for(request)
     files_removed = 0
     bytes_freed = 0
 
-    for directory in (AUDIO_DIR, IMAGES_DIR):
-        for path in directory.iterdir():
-            freed = _remove_file(path)
+    for record in records:
+        refs = [track["ref"] for track in record["tracks"] or []]
+        if record["image_source"]["kind"] == "upload":
+            refs.append(record["image_source"]["ref"])
+        for ref in refs:
+            freed = storage.delete_file(ref)
             if freed is not None:
                 bytes_freed += freed
                 files_removed += 1
 
-    SESSIONS.clear()
+    records.clear()
+    storage.delete_session_records(token)
 
     return {
         "files_removed": files_removed,
@@ -344,37 +400,64 @@ def wipe_history() -> dict:
     }
 
 
+def refreshed(record: dict) -> dict:
+    """A copy of one run record with every track/image url recomputed from
+    its ref rather than trusting whatever was persisted with it.
+
+    Locally that's a no-op (/files/<ref> never expires), but a GCS signed
+    URL does -- generate_signed_url's expiration is far shorter than the
+    30-day retention window a run can otherwise sit in the bucket for, so a
+    record read back after that needs a fresh URL, not the stale one it was
+    saved with.
+    """
+    record = {**record}
+    if record["image_source"]["kind"] == "upload":
+        record["image_source"] = {
+            **record["image_source"],
+            "url": storage.playback_url(record["image_source"]["ref"]),
+        }
+    if record["tracks"]:
+        record["tracks"] = [
+            {**track, "url": storage.playback_url(track["ref"])}
+            for track in record["tracks"]
+        ]
+    return record
+
+
 @app.get("/history")
-def list_history() -> list[dict]:
-    """The whole session's runs, newest first -- lets a frontend page reload
-    rehydrate its cards, as long as the backend process itself hasn't
-    restarted (the in-memory tradeoff; see SESSIONS above)."""
-    return list(reversed(SESSIONS))
+def list_history(request: Request) -> list[dict]:
+    """This visitor's runs, newest first -- lets a frontend page reload
+    rehydrate its cards, as long as this process still has (or storage can
+    recover) that visitor's run list."""
+    _, records = _session_for(request)
+    return [refreshed(record) for record in reversed(records)]
 
 
 @app.delete("/history/{run_id}")
-def delete_run(run_id: str) -> dict:
+def delete_run(request: Request, run_id: str) -> dict:
     """Removes one run: its record, its MP3s, and its persisted image (if
-    it has one). 404 if the id isn't there -- already deleted, or the
-    backend restarted since."""
-    record = find_session(run_id)
+    it has one). 404 if the id isn't there -- already deleted, or this
+    visitor's run list doesn't have it."""
+    token, records = _session_for(request)
+    record = find_session(records, run_id)
     if record is None:
         raise HTTPException(404, f"No run with id {run_id!r}.")
 
     files_removed = 0
     bytes_freed = 0
 
-    paths = [HISTORY_DIR / track["audioFile"] for track in record["tracks"] or []]
+    refs = [track["ref"] for track in record["tracks"] or []]
     if record["image_source"]["kind"] == "upload":
-        paths.append(HISTORY_DIR / record["image_source"]["path"])
+        refs.append(record["image_source"]["ref"])
 
-    for path in paths:
-        freed = _remove_file(path)
+    for ref in refs:
+        freed = storage.delete_file(ref)
         if freed is not None:
             bytes_freed += freed
             files_removed += 1
 
-    SESSIONS.remove(record)
+    records.remove(record)
+    storage.save_session_records(token, records)
 
     return {
         "files_removed": files_removed,
@@ -441,6 +524,7 @@ def build_tagging_summary(
 
 @app.post("/tag")
 def tag(
+    request: Request,
     image: UploadFile | None = File(None),
     sample_image: str = "",
     genre: str = "",
@@ -480,12 +564,13 @@ def tag(
     the browser is enforcing, which the frontend's own POSTs to this same
     endpoint don't require. Reading server-side sidesteps that entirely.
 
-    Rejects with 409 once the session already holds `MAX_SESSIONS` runs --
-    checked here, before any tagging work (including the heavy model
+    Rejects with 409 once this visitor's session already holds `MAX_SESSIONS`
+    runs -- checked here, before any tagging work (including the heavy model
     imports below) runs, rather than after paying for a tag extraction that
     couldn't be kept anyway.
     """
-    if len(SESSIONS) >= MAX_SESSIONS:
+    token, records = _session_for(request)
+    if len(records) >= MAX_SESSIONS:
         raise HTTPException(
             409,
             f"This session already holds {MAX_SESSIONS} runs. "
@@ -527,11 +612,7 @@ def tag(
         # its extension or lying about it. No collision handling needed --
         # run_id is already unique.
         ext = (image.content_type or "").removeprefix("image/") or "png"
-        image_source = {
-            "kind": "upload",
-            "filename": image.filename or "",
-            "path": f"images/{run_id}.{ext}",
-        }
+        image_source = {"kind": "upload", "filename": image.filename or ""}
     else:
         raise HTTPException(status_code=400, detail="Provide either an uploaded image or a sample_image filename.")
     # Computed once and reused below for the embedding-space plot -- tags_by_facet
@@ -606,11 +687,13 @@ def tag(
     prompt = ", ".join([prompt_term(genre), *tags] if genre else tags)
 
     # Only reached once tagging has actually succeeded -- an uploaded image's
-    # bytes are written to disk, and the run is added to the session list,
-    # here rather than up front, so a request that errors out above leaves
-    # neither an orphaned file nor a half-formed record behind.
+    # bytes are persisted, and the run is added to the session list, here
+    # rather than up front, so a request that errors out above leaves neither
+    # an orphaned file nor a half-formed record behind.
     if image_source["kind"] == "upload":
-        (IMAGES_DIR / Path(image_source["path"]).name).write_bytes(image_bytes)
+        ref = storage.put_file(token, f"images/{run_id}.{ext}", image_bytes)
+        image_source["ref"] = ref
+        image_source["url"] = storage.playback_url(ref)
 
     record = {
         "id": run_id,
@@ -623,7 +706,8 @@ def tag(
         "prompt": prompt,
         "tracks": None,
     }
-    SESSIONS.append(record)
+    records.append(record)
+    storage.save_session_records(token, records)
 
     return {
         "id": run_id,
@@ -637,7 +721,7 @@ def tag(
 
 
 @app.post("/generate")
-def generate(run_id: str):
+def generate(request: Request, run_id: str):
     """Renders a song for a run `/tag` already produced.
 
     Deliberately does no tagging of its own -- the image, tags, and judge
@@ -646,10 +730,11 @@ def generate(run_id: str):
     judge never runs twice for the same image. `run_id` is the only input;
     everything else (algorithm, prompt, the original image's name for the
     audio naming convention) comes off the stored record. 404s if the id
-    isn't in the session list -- already deleted, or the backend restarted
-    since `/tag` ran.
+    isn't in this visitor's run list -- already deleted, or storage had
+    nothing to recover for this token.
     """
-    record = find_session(run_id)
+    token, records = _session_for(request)
+    record = find_session(records, run_id)
     if record is None:
         raise HTTPException(404, f"No run with id {run_id!r}. It may have been deleted, or the backend restarted since it was tagged.")
 
@@ -659,8 +744,9 @@ def generate(run_id: str):
     )
 
     job = request_song(record["prompt"])
-    tracks = save_audio(original_filename, job, record["algorithm"])
+    tracks = save_audio(token, run_id, original_filename, job, record["algorithm"])
     record["tracks"] = tracks
+    storage.save_session_records(token, records)
 
     return {
         "id": run_id,
