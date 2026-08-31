@@ -25,12 +25,18 @@ backend/history/
 # automatically on first use per algorithm (see embedding_tagger.py).
 backend/vocab_cache/
 
+# Cached sample-image thumbnails -- derived from test-images/, regenerated
+# automatically on first request per image (see thumbnails.py).
+backend/thumbnail_cache/
+
 # Local planning/guidance docs — not meant to be published in the repo
 /CLAUDE.md
 /PLAN.md
 /DEPLOYMENT.md
 /PLAN-phase1-history.md
 /PLAN-phase2-deployment.md
+/PLAN-phase3-isolation.md
+/PLAN-phase4-optimization.md
 
 # Throwaway local sandbox, not part of the app
 /musicgen-experiment/

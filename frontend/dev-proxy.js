@@ -40,6 +40,7 @@ const BACKEND_PATH_PREFIXES = [
   "/algorithms",
   "/test-images",
   "/test-image-files",
+  "/test-image-thumbnails",
   "/files",
 ];
 
@@ -51,9 +52,18 @@ const proxy = httpProxy.createProxyServer({});
 
 proxy.on("error", (err, req, res) => {
   console.error(`proxy error for ${req.url}:`, err.message);
-  if (res.writeHead) {
+  if (!res.writeHead) return;
+  if (isBackendPath(req.url)) {
+    // lib.ts's apiRequest always does response.json() before checking
+    // response.ok -- a plain-text body here throws a SyntaxError there
+    // instead of surfacing the fallback message the UI was designed to
+    // show (e.g. "Could not analyze the image with siglip."), so this has
+    // to look like a JSON error response, not a human-readable one.
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ detail: "Bad gateway (is the backend running?)" }));
+  } else {
     res.writeHead(502);
-    res.end("Bad gateway (is the target server running?)");
+    res.end("Bad gateway (is the frontend dev server running?)");
   }
 });
 

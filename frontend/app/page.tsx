@@ -13,10 +13,22 @@ import {
   cardFromAnalysis,
   cardFromRecord,
   generateUrl,
+  type ImageSource,
   isCardBusy,
   MAX_CARDS,
+  sampleThumbnailUrl,
   type SessionRecord,
 } from "./lib";
+
+// The only URLs this app ever creates client-side (see startRun's
+// uploadPreviewUrl) -- revoked wherever a card holding one stops being
+// shown, so a failed/deleted/cleared upload doesn't leak its blob for the
+// rest of the tab's life.
+function revokeIfLocalPreview(imageSource: ImageSource | null) {
+  if (imageSource?.kind === "upload" && imageSource.url.startsWith("blob:")) {
+    URL.revokeObjectURL(imageSource.url);
+  }
+}
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
@@ -171,6 +183,7 @@ export default function Home() {
       setFile(null);
       setFileInputKey((key) => key + 1);
       setSelectedSample(null);
+      cards.forEach((c) => revokeIfLocalPreview(c.imageSource));
       setCards([]);
       setExpanded({});
       setQuery("");
@@ -255,6 +268,11 @@ export default function Home() {
       })
       .catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
+        // The card stays as an error card rather than being dropped (see the
+        // comment above), but this local preview never gets a backend URL to
+        // replace it with -- free it now instead of leaking it for the rest
+        // of the tab's life.
+        if (uploadPreviewUrl) URL.revokeObjectURL(uploadPreviewUrl);
         setCards((prev) =>
           prev.map((c) =>
             c.id === pendingId ? { ...c, result: { status: "error", error: message } } : c,
@@ -299,7 +317,11 @@ export default function Home() {
   }
 
   function dropCardLocally(cardId: string) {
-    setCards((prev) => prev.filter((c) => c.id !== cardId));
+    setCards((prev) => {
+      const card = prev.find((c) => c.id === cardId);
+      if (card) revokeIfLocalPreview(card.imageSource);
+      return prev.filter((c) => c.id !== cardId);
+    });
     setExpanded((prev) => {
       if (!(cardId in prev)) return prev;
       const next = { ...prev };
@@ -368,7 +390,7 @@ export default function Home() {
                 aria-pressed={selectedSample === name}
               >
                 {/* eslint-disable-next-line @next/next/no-img-element -- local backend-served URL, not a remote image */}
-                <img src={`${API_URL}/test-image-files/${name}`} alt="" />
+                <img src={sampleThumbnailUrl(name)} alt="" loading="lazy" />
               </button>
             ),
           )}

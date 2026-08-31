@@ -5,7 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import lru_cache
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,11 +13,13 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 # Safe to import at module level: plain strings and a lookup, no heavy dependencies.
-from algorithms import ALGORITHMS, ALGORITHM_INFO, validate_algorithm
+from algorithms import ALGORITHMS, ALGORITHM_INFO, DEFAULT_ALGORITHM, validate_algorithm
 from genres import GENRES, prompt_term, validate_genre
+from thumbnails import thumbnail_path
 import storage
 
 # Reads backend/.env and puts the keys into the process environment,
@@ -37,11 +39,9 @@ def _preload_algorithm(algorithm: str) -> None:
     visitor's first /tag call for it doesn't pay for loading it mid-request.
 
     Runs off the request path, in its own thread rather than blocking
-    startup -- Cloud Run's own startup check shouldn't have to wait for any
-    of these to finish. embedding_tagger's per-algorithm lock already makes
-    this safe to race against a real request that gets to this algorithm
-    first, and against the other three algorithms' own preload threads,
-    which never touch each other's state.
+    startup -- Cloud Run's own startup check shouldn't have to wait for it
+    to finish. embedding_tagger's per-algorithm lock already makes this safe
+    to race against a real request that gets to this algorithm first.
     """
     from embedding_tagger import _load
 
@@ -54,14 +54,21 @@ def _preload_algorithm(algorithm: str) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Only in the deployed container -- local dev's `--reload` restarts
-    # shouldn't eagerly reload every algorithm on every file save. One
-    # thread per algorithm, all four started together, rather than one
-    # thread looping through them -- so a cold start's total load time is
-    # bounded by however long the slowest single algorithm takes, not the
-    # sum of all four.
+    # shouldn't eagerly reload every algorithm on every file save.
+    #
+    # Only DEFAULT_ALGORITHM (SigLIP), not all four: a burst of traffic big
+    # enough to spin up several fresh Cloud Run instances at once (exactly
+    # the case maxScale>1 exists for) used to mean each of those instances
+    # spent its first several seconds with all four preload threads fighting
+    # an actual incoming request for the same CPU -- confirmed live, cold
+    # requests were taking 15-40s under a concurrent-instance-startup burst.
+    # The other three algorithms still load lazily and correctly on first
+    # use (embedding_tagger._load's own per-algorithm lock handles that
+    # regardless of whether anything preloaded it) -- this only removes the
+    # eager warm-up for algorithms most visitors aren't defaulting to, per
+    # frontend/app/page.tsx's own selectedAlgorithm default.
     if FRONTEND_DIST.is_dir():
-        for algorithm in ALGORITHMS:
-            threading.Thread(target=_preload_algorithm, args=(algorithm,), daemon=True).start()
+        threading.Thread(target=_preload_algorithm, args=(DEFAULT_ALGORITHM,), daemon=True).start()
     yield
 
 
@@ -93,11 +100,14 @@ TEST_IMAGES_DIR = Path(__file__).parent.parent / "test-images"
 
 MAX_SESSIONS = 20
 
-# One run list per visitor, in memory for the life of this process --
-# recovered from storage on first touch per token (see _session_for), since
-# a Cloud Run instance recycle (idle scale-to-zero, a redeploy, a crash)
-# drops this dict the same way a restart drops SESSIONS did before per-visitor
-# isolation existed. Each record:
+# One run list per visitor. In local dev (no SESSION_BUCKET) this is the
+# real cache: _session_for loads a token's list from disk once, then trusts
+# this dict for the rest of the process's life, safe only because local dev
+# never has more than one process. In GCS mode _session_for and every write
+# below always go straight to storage instead (see both their own
+# docstrings) -- correctness there can't depend on which Cloud Run instance
+# a request lands on, so this dict is simply never populated in that mode
+# (see _update_local_cache). Each record:
 #   {id, created_at, algorithm, image_source, tags, tag_scores, tagging,
 #    prompt, tracks}
 # where image_source is {"kind": "sample", "name": <str>} or
@@ -106,17 +116,121 @@ MAX_SESSIONS = 20
 # displays directly). `tracks` stays None until /generate fills it in.
 _sessions: dict[str, list[dict]] = {}
 
+# Guards every read-modify-write against one visitor's slice of _sessions and
+# its on-disk/GCS backing (check a cap, mutate a list, persist it) --
+# without this, two concurrent requests for the same visitor (two tabs, or a
+# double-click) can each load the same list, mutate their own copy, and
+# save, with the second save silently discarding the first's run. Keyed per
+# token rather than one lock for every visitor, so visitor A's slow GCS
+# round trip never blocks visitor B's unrelated request in the same process.
+# This still only protects one process/Cloud Run instance; it doesn't make
+# save_session_records itself a distributed lock across instances, which
+# per-visitor history doesn't have today.
+_session_locks: dict[str, threading.Lock] = {}
+# Guards only _session_locks' own creation of a new per-token Lock -- held
+# far more briefly than any _session_locks[token] itself.
+_session_locks_meta_lock = threading.Lock()
+
+# run_ids currently mid-/generate, so a retry or double-click for the same
+# run can be told "already in progress" instead of paying for a second Suno
+# job. Deliberately not a field on the session record itself: that dict is
+# what storage.save_session_records pickles, and a mid-flight-only flag has
+# no business being persisted (or briefly leaking into a save some other
+# request triggers while /generate is still running).
+#
+# Process-local, same limitation as _sessions/_lock_for above -- safe today
+# only because maxScale=1 means one process. In GCS mode generate() below
+# claims run_id through storage.claim_generation instead, which is safe
+# across instances; this set is the fallback for local dev, where there's
+# never more than one process to race against.
+_generating_runs: set[str] = set()
+
+# Safety margin added on top of GIVE_UP_AFTER_SECONDS before a GCS
+# generation claim is considered abandoned (see storage.claim_generation) --
+# wider than the poll loop's own deadline so a legitimately slow-but-still-
+# polling request is never mistaken for a crashed one.
+GENERATION_CLAIM_STALE_AFTER = timedelta(seconds=GIVE_UP_AFTER_SECONDS + 60)
+
+
+def _lock_for(token: str) -> threading.Lock:
+    with _session_locks_meta_lock:
+        if token not in _session_locks:
+            _session_locks[token] = threading.Lock()
+        return _session_locks[token]
+
+
+def _claim_generation(token: str, run_id: str) -> bool:
+    """True if this process may proceed with Suno submission for run_id;
+    False if someone else already holds a live claim. Call while already
+    holding `_lock_for(token)` -- in GCS mode the claim itself is atomic
+    across instances via storage.claim_generation, but this still runs
+    under the caller's lock so only one thread in this process attempts the
+    GCS call for a given token at a time; in local dev the lock is what
+    makes the plain set check-then-add atomic at all.
+    """
+    if storage.gcs_configured():
+        return storage.claim_generation(token, run_id, GENERATION_CLAIM_STALE_AFTER)
+    if run_id in _generating_runs:
+        return False
+    _generating_runs.add(run_id)
+    return True
+
+
+def _generation_in_progress(token: str, run_id: str) -> bool:
+    """Read-only: is run_id currently mid-/generate on some instance right
+    now? Used by delete_run to refuse deleting a run that's actively being
+    rendered -- without this, a delete racing a /generate for the same
+    run_id could let Suno finish and get paid for with no record left in
+    the visitor's list to attach the result to (see AIE-001). Doesn't claim
+    or release anything, unlike _claim_generation. Call while holding
+    `_lock_for(token)`, same as _claim_generation, for local-mode
+    consistency with generate()'s own set check.
+    """
+    if storage.gcs_configured():
+        return storage.generation_claimed(token, run_id, GENERATION_CLAIM_STALE_AFTER)
+    return run_id in _generating_runs
+
+
+def _release_generation_claim(token: str, run_id: str) -> None:
+    """Undoes _claim_generation, on both the success and failure paths of
+    the Suno call it guarded. Same locking expectation as _claim_generation."""
+    if storage.gcs_configured():
+        storage.release_generation_claim(token, run_id)
+    else:
+        _generating_runs.discard(run_id)
+
 
 def _session_for(request: Request) -> tuple[str, list[dict]]:
-    """This visitor's token and run list. The token itself was already
-    resolved by session_cookie_middleware before any route runs; the list is
-    recovered from storage the first time this process sees this token, then
-    cached here for the rest of the process's life.
+    """This visitor's token and current run list.
+
+    In GCS mode this always reads fresh from storage -- caching it here
+    would mean a visitor's GET /history could serve whatever THIS instance
+    happened to have cached on its first-ever touch of that visitor,
+    forever, even after a different instance's write. mutate_session_records
+    already never trusts this cache for writes (it does its own fresh read
+    right before every write, which is what makes writes correct regardless
+    of routing); reads need the same rule to get the same guarantee, not a
+    separate one. In local dev (never more than one process, so nothing
+    else can have written in between) the cache is safe and still used, so
+    a session with many runs isn't re-read from disk on every request.
     """
     token = request.state.session_token
-    if token not in _sessions:
-        _sessions[token] = storage.load_session_records(token) or []
-    return token, _sessions[token]
+    if storage.gcs_configured():
+        return token, storage.load_session_records(token) or []
+    with _lock_for(token):
+        if token not in _sessions:
+            _sessions[token] = storage.load_session_records(token) or []
+        return token, _sessions[token]
+
+
+def _update_local_cache(token: str, records: list[dict]) -> None:
+    """Keeps the local-dev cache in sync after a mutation. A no-op in GCS
+    mode, where _session_for (above) never reads _sessions at all -- so
+    there's nothing to keep in sync there, and no reason to grow this dict
+    with entries nothing will ever read again (one entry per distinct
+    visitor this process has ever seen, for the life of the process)."""
+    if not storage.gcs_configured():
+        _sessions[token] = records
 
 
 def find_session(records: list[dict], run_id: str) -> dict | None:
@@ -187,6 +301,21 @@ async def session_cookie_middleware(request: Request, call_next):
             secure=True,
         )
     return response
+
+
+@app.exception_handler(storage.SessionWriteConflict)
+async def session_write_conflict_handler(request: Request, exc: storage.SessionWriteConflict):
+    """Maps storage.py's own give-up-after-N-retries exception to a 503
+    with a normal JSON `detail` body (matching every other error response
+    here) instead of letting it fall through to FastAPI's generic
+    unhandled-exception 500 -- this is a real, expected-under-heavy-
+    contention outcome (see AIE-002), not a bug, so it's worth a message
+    that tells the frontend to just retry rather than looking like a crash.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "This session is under heavy concurrent load right now -- please try again."},
+    )
 
 
 @app.get("/api/health")
@@ -369,6 +498,17 @@ def save_audio(
     return tracks
 
 
+def _delete_file_safe(ref: str, context: str) -> int | None:
+    """storage.delete_file, but one ref failing (a transient GCS error)
+    doesn't abort the rest of the caller's loop -- prints and returns None
+    (as if the file were already gone) instead of raising."""
+    try:
+        return storage.delete_file(ref)
+    except Exception as exc:
+        print(f"could not delete {ref!r} during {context}: {exc}")
+        return None
+
+
 @app.delete("/history")
 def wipe_history(request: Request) -> dict:
     """Deletes every MP3 and persisted image this visitor has downloaded so
@@ -386,13 +526,21 @@ def wipe_history(request: Request) -> dict:
         if record["image_source"]["kind"] == "upload":
             refs.append(record["image_source"]["ref"])
         for ref in refs:
-            freed = storage.delete_file(ref)
+            freed = _delete_file_safe(ref, "wipe_history")
             if freed is not None:
                 bytes_freed += freed
                 files_removed += 1
 
-    records.clear()
-    storage.delete_session_records(token)
+    # Unlike tag/delete_run/generate below, this doesn't need
+    # mutate_session_records' conditional-write dance: a full wipe's result
+    # is the same regardless of what else races it (delete-then-delete is a
+    # no-op the second time; a concurrent tag() elsewhere that loses the
+    # generation race against this delete just retries against the now-empty
+    # state and correctly ends up as the only thing left) -- there's no
+    # "lost write" for an operation whose whole point is "nothing survives."
+    with _lock_for(token):
+        _update_local_cache(token, [])
+        storage.delete_session_records(token)
 
     return {
         "files_removed": files_removed,
@@ -437,11 +585,25 @@ def list_history(request: Request) -> list[dict]:
 def delete_run(request: Request, run_id: str) -> dict:
     """Removes one run: its record, its MP3s, and its persisted image (if
     it has one). 404 if the id isn't there -- already deleted, or this
-    visitor's run list doesn't have it."""
+    visitor's run list doesn't have it.
+
+    409s instead if run_id is currently mid-/generate (see
+    _generation_in_progress) -- otherwise a delete racing a generate for
+    the same run could let Suno finish and get paid for with nothing left
+    in the visitor's list to attach the result to.
+    """
     token, records = _session_for(request)
     record = find_session(records, run_id)
     if record is None:
         raise HTTPException(404, f"No run with id {run_id!r}.")
+
+    with _lock_for(token):
+        if _generation_in_progress(token, run_id):
+            raise HTTPException(
+                409,
+                "This run is currently generating a song and can't be "
+                "deleted until it finishes.",
+            )
 
     files_removed = 0
     bytes_freed = 0
@@ -451,13 +613,23 @@ def delete_run(request: Request, run_id: str) -> dict:
         refs.append(record["image_source"]["ref"])
 
     for ref in refs:
-        freed = storage.delete_file(ref)
+        freed = _delete_file_safe(ref, "delete_run")
         if freed is not None:
             bytes_freed += freed
             files_removed += 1
 
-    records.remove(record)
-    storage.save_session_records(token, records)
+    # Removal by id rather than reusing the `record` object found above --
+    # mutate_session_records may hand its mutator a fresher list (a
+    # concurrent instance's write this process hasn't seen yet) whose
+    # matching record isn't the same object. Idempotent if that fresher list
+    # has already lost this id some other way (e.g. someone else deleted it
+    # too), so a second racing delete_run for the same run_id is a no-op
+    # here rather than a KeyError.
+    def _remove(current: list[dict]) -> list[dict]:
+        return [r for r in current if r["id"] != run_id]
+
+    with _lock_for(token):
+        _update_local_cache(token, storage.mutate_session_records(token, _remove))
 
     return {
         "files_removed": files_removed,
@@ -502,6 +674,25 @@ def list_test_images() -> list[str]:
     `/test-image-files/<name>` (mounted below) rather than this route.
     """
     return sorted(known_sample_images())
+
+
+@app.get("/test-image-thumbnails/{name}")
+def test_image_thumbnail(name: str):
+    """A small cached preview of one sample image -- what the picker grid
+    and RunCard's thumb actually display; see thumbnails.py. `/tag` still
+    reads the full-resolution original directly from TEST_IMAGES_DIR for
+    the actual embedding, untouched by this route.
+
+    Validated against the same known_sample_images() as `/tag`'s own
+    sample_image check, so a name this route will serve is always one
+    `/tag` will accept, and vice versa.
+    """
+    if name not in known_sample_images():
+        raise HTTPException(status_code=404, detail=f"Unknown sample image: {name}")
+    path = thumbnail_path(TEST_IMAGES_DIR / name)
+    # Sample images never change under a fixed filename, so the browser can
+    # cache the thumbnail indefinitely instead of re-requesting it every visit.
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 def build_tagging_summary(
@@ -706,8 +897,24 @@ def tag(
         "prompt": prompt,
         "tracks": None,
     }
-    records.append(record)
-    storage.save_session_records(token, records)
+    # Re-checked here, inside the lock and against mutate_session_records'
+    # own fresh read, rather than trusting the early check above or this
+    # process's cached `records` -- two concurrent /tag calls for the same
+    # visitor (same instance, or, in GCS mode, a different one) can both
+    # pass the early check before either has appended. This is the
+    # authoritative one: raising from inside the mutator means it's judged
+    # against whatever the storage layer just read, not a stale local copy.
+    def _append(current: list[dict]) -> list[dict]:
+        if len(current) >= MAX_SESSIONS:
+            raise HTTPException(
+                409,
+                f"This session already holds {MAX_SESSIONS} runs. "
+                "Delete one (or Clear) before starting another.",
+            )
+        return current + [record]
+
+    with _lock_for(token):
+        _update_local_cache(token, storage.mutate_session_records(token, _append))
 
     return {
         "id": run_id,
@@ -717,6 +924,19 @@ def tag(
         "prompt": prompt,
         "algorithm": algorithm,
         "image_source": image_source,
+    }
+
+
+def _generation_response(run_id: str, record: dict, job_id: str | None, tracks: list[dict]) -> dict:
+    return {
+        "id": run_id,
+        "algorithm": record["algorithm"],
+        "tags": record["tags"],
+        "tag_scores": record["tag_scores"],
+        "tagging": record["tagging"],
+        "prompt": record["prompt"],
+        "job_id": job_id,
+        "tracks": tracks,
     }
 
 
@@ -738,26 +958,59 @@ def generate(request: Request, run_id: str):
     if record is None:
         raise HTTPException(404, f"No run with id {run_id!r}. It may have been deleted, or the backend restarted since it was tagged.")
 
+    # Guards against a slow request (Suno rendering can take up to
+    # GIVE_UP_AFTER_SECONDS) getting retried -- by the client, or a
+    # double-click -- while the first call is still in flight, or after it
+    # already finished. Either would otherwise resubmit a second, separately
+    # billed Suno job and race the first call's writes to the same audio
+    # refs. `tracks` already set means this run was already rendered: hand
+    # that back rather than paying Suno again for the same run_id.
+    with _lock_for(token):
+        if record["tracks"]:
+            return _generation_response(run_id, record, None, record["tracks"])
+        if not _claim_generation(token, run_id):
+            raise HTTPException(409, "This run is already generating a song.")
+        # The claim above only proves no OTHER instance is currently
+        # generating this run -- it doesn't prove the run still exists. A
+        # concurrent delete_run on another instance could have removed it
+        # between this process's `find_session` above and now (that route's
+        # own _generation_in_progress check closes the reverse ordering,
+        # but not this one). GCS-mode only: local dev's single shared lock
+        # already makes this interleaving impossible, so the extra read
+        # would be pure overhead there.
+        if storage.gcs_configured():
+            fresh = storage.load_session_records(token) or []
+            if find_session(fresh, run_id) is None:
+                _release_generation_claim(token, run_id)
+                raise HTTPException(404, f"No run with id {run_id!r}. It was deleted just now.")
+
     image_source = record["image_source"]
     original_filename = (
         image_source["filename"] if image_source["kind"] == "upload" else image_source["name"]
     )
 
-    job = request_song(record["prompt"])
-    tracks = save_audio(token, run_id, original_filename, job, record["algorithm"])
-    record["tracks"] = tracks
-    storage.save_session_records(token, records)
+    try:
+        job = request_song(record["prompt"])
+        tracks = save_audio(token, run_id, original_filename, job, record["algorithm"])
+    except Exception:
+        with _lock_for(token):
+            _release_generation_claim(token, run_id)
+        raise
 
-    return {
-        "id": run_id,
-        "algorithm": record["algorithm"],
-        "tags": record["tags"],
-        "tag_scores": record["tag_scores"],
-        "tagging": record["tagging"],
-        "prompt": record["prompt"],
-        "job_id": job["id"],
-        "tracks": tracks,
-    }
+    # By id, through mutate_session_records, same reasoning as delete_run:
+    # this instance's `records` may be behind another instance's writes, so
+    # the field is set against mutate_session_records' own fresh read
+    # rather than the in-memory `record` this function has been using above
+    # for prompt/algorithm/image_source (those don't change mid-generate,
+    # only `tracks` does).
+    def _fill_tracks(current: list[dict]) -> list[dict]:
+        return [{**r, "tracks": tracks} if r["id"] == run_id else r for r in current]
+
+    with _lock_for(token):
+        _update_local_cache(token, storage.mutate_session_records(token, _fill_tracks))
+        _release_generation_claim(token, run_id)
+
+    return _generation_response(run_id, record, job["id"], tracks)
 
 
 # Serves the saved images and MP3s, so the frontend can play a song from local

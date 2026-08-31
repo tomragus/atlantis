@@ -159,15 +159,22 @@ export type Card = {
   result: RunResult;
 };
 
+// A sample image's small cached preview (backend/thumbnails.py) -- the only
+// size a sample image is ever displayed at: the picker grid's ~166px tiles
+// and RunCard's 42px run-card-thumb both use this rather than the
+// full-resolution original /test-image-files serves (still what /tag reads
+// for the actual embedding).
+export function sampleThumbnailUrl(name: string): string {
+  return `${API_URL}/test-image-thumbnails/${encodeURIComponent(name)}`;
+}
+
 // Builds a card's image URL straight off its `ImageSource` -- works
-// identically whether that's a sample's static path, an upload's real
+// identically whether that's a sample's thumbnail, an upload's real
 // backend-served URL once `/tag` has returned (persisted through
 // storage.py), or (see startRun in page.tsx) an upload's temporary local
 // object URL standing in before that.
 export function previewUrlFor(imageSource: ImageSource): string {
-  return imageSource.kind === "upload"
-    ? imageSource.url
-    : `${API_URL}/test-image-files/${encodeURIComponent(imageSource.name)}`;
+  return imageSource.kind === "upload" ? imageSource.url : sampleThumbnailUrl(imageSource.name);
 }
 
 // What `GET /history` returns per entry -- the backend's own session record
@@ -278,18 +285,29 @@ export async function apiRequest(
   options: RequestInit,
   fallbackMessage: string,
 ) {
+  let response: Response;
   try {
-    const response = await fetch(url, { ...options, credentials: "include" });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.detail ?? fallbackMessage);
-    }
-    return data;
-  } catch (err) {
-    throw new Error(
-      err instanceof Error ? err.message : "Could not reach the server.",
-    );
+    response = await fetch(url, { ...options, credentials: "include" });
+  } catch {
+    throw new Error("Could not reach the server.");
   }
+
+  // Callers each know their own expected shape; this just needs to read `.detail`.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let data: any;
+  try {
+    data = await response.json();
+  } catch {
+    // A non-JSON body (an HTML error page, a bare-text gateway error from
+    // e.g. the local dev proxy) has no server-authored detail to show --
+    // fall back rather than surfacing the raw JSON-parse error.
+    throw new Error(fallbackMessage);
+  }
+
+  if (!response.ok) {
+    throw new Error(data.detail ?? fallbackMessage);
+  }
+  return data;
 }
 
 // Scores sit in a narrow band near zero (SigLIP's probabilities, and the other
