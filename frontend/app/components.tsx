@@ -415,12 +415,22 @@ export function RunRow({
                   disabled={result.generating || generateBusy}
                   className="btn-primary"
                 >
-                  {result.generating ? "Composing…" : "Generate Songs"}
+                  {result.queuePosition !== undefined
+                    ? "Queued…"
+                    : result.generating
+                      ? "Composing…"
+                      : "Generate Songs"}
                 </button>
               </div>
             )}
 
-            {result.generating && (
+            {result.queuePosition !== undefined && (
+              <p className="status-notice">
+                Queued — {result.queuePosition} ahead of you.
+              </p>
+            )}
+
+            {result.generating && result.queuePosition === undefined && (
               <p className="status-notice">
                 Generating... takes about 2 minutes.
               </p>
@@ -448,6 +458,7 @@ export function RunRow({
 function cardStatusWord(result: RunResult): string {
   if (result.status === "loading") return "tagging…";
   if (result.status === "error") return "error";
+  if (result.queuePosition !== undefined) return "queued…";
   if (result.generating) return "generating…";
   if (result.generated) return "generated";
   return "ready";

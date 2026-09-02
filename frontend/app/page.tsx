@@ -12,6 +12,9 @@ import {
   type Card,
   cardFromAnalysis,
   cardFromRecord,
+  type GeneratedSong,
+  type GenerateStatusResponse,
+  generateStatusUrl,
   generateUrl,
   type ImageSource,
   isCardBusy,
@@ -281,6 +284,76 @@ export default function Home() {
       });
   }
 
+  // How often a queued card checks GET /generate/{run_id}/status. A few
+  // seconds is frequent enough that "position" feels live without hammering
+  // the backend -- each tick is one GCS-optimistic-concurrency round trip
+  // in production (see backend/storage.py's mutate_queue).
+  const GENERATE_POLL_INTERVAL_MS = 3000;
+
+  // Marks a card queued (or updates its live position) without touching
+  // any of its other result fields.
+  function setQueuePosition(cardId: string, position: number) {
+    setCards((prev) =>
+      prev.map((c) =>
+        c.id === cardId ? { ...c, result: { ...c.result, queuePosition: position } } : c,
+      ),
+    );
+  }
+
+  // Settles a card once its song is ready -- shared by the fast path
+  // (POST /generate returned it directly) and the queued path (a status
+  // poll eventually did). Both hand this a superset of GeneratedSong (the
+  // status poll's payload also carries `status: "done"` plus the tagging
+  // fields _generation_response echoes back) -- only `tracks`/`job_id` are
+  // ever read back off it, so the extra fields are harmless to store.
+  function settleGenerated(cardId: string, generated: GeneratedSong) {
+    setCards((prev) =>
+      prev.map((c) =>
+        c.id === cardId
+          ? { ...c, result: { ...c.result, generating: false, generated, queuePosition: undefined } }
+          : c,
+      ),
+    );
+  }
+
+  function settleGenerateError(cardId: string, message: string) {
+    setCards((prev) =>
+      prev.map((c) =>
+        c.id === cardId
+          ? { ...c, result: { ...c.result, generating: false, generateError: message, queuePosition: undefined } }
+          : c,
+      ),
+    );
+  }
+
+  // Polls GET /generate/{run_id}/status every GENERATE_POLL_INTERVAL_MS
+  // until the run is done or errors -- scheduling the *next* poll only
+  // after the current one resolves (rather than setInterval) so a slow
+  // response can't pile up overlapping requests for the same card.
+  function pollGenerateStatus(cardId: string) {
+    setTimeout(async () => {
+      try {
+        const data: GenerateStatusResponse = await apiRequest(
+          generateStatusUrl(cardId),
+          { method: "GET" },
+          "Could not check generation status.",
+        );
+        if (data.status === "queued") {
+          setQueuePosition(cardId, data.position);
+          pollGenerateStatus(cardId);
+        } else if (data.status === "generating") {
+          pollGenerateStatus(cardId);
+        } else if (data.status === "error") {
+          settleGenerateError(cardId, data.detail);
+        } else {
+          settleGenerated(cardId, data);
+        }
+      } catch (err) {
+        settleGenerateError(cardId, err instanceof Error ? err.message : String(err));
+      }
+    }, GENERATE_POLL_INTERVAL_MS);
+  }
+
   async function handleGenerate(cardId: string) {
     const card = cards.find((c) => c.id === cardId);
     if (!card || card.result.status !== "ready" || busy) return;
@@ -288,7 +361,7 @@ export default function Home() {
     setCards((prev) =>
       prev.map((c) =>
         c.id === cardId
-          ? { ...c, result: { ...c.result, generating: true, generateError: undefined } }
+          ? { ...c, result: { ...c.result, generating: true, generateError: undefined, queuePosition: undefined } }
           : c,
       ),
     );
@@ -299,20 +372,27 @@ export default function Home() {
         { method: "POST" },
         "Could not generate a song.",
       );
-      setCards((prev) =>
-        prev.map((c) =>
-          c.id === cardId ? { ...c, result: { ...c.result, generating: false, generated: data } } : c,
-        ),
-      );
+      if (data.status === "queued") {
+        setQueuePosition(cardId, data.position);
+        pollGenerateStatus(cardId);
+        return;
+      }
+      if (data.status === "generating") {
+        // A slot was free immediately, but the backend only waits up to
+        // ~15s per request for Suno before responding (see
+        // PLAN-generate-bounded-wait.md) -- the render is still going, so
+        // fall back to the same status polling the queued path already
+        // uses. The "Composing..." state (generating && no queuePosition)
+        // already covers this; nothing else needs to change here.
+        pollGenerateStatus(cardId);
+        return;
+      }
+      // The fast path: a queue slot was free immediately and the render
+      // finished inside the bounded wait, so `data` is the plain generated
+      // song, not a queue-shaped response.
+      settleGenerated(cardId, data);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setCards((prev) =>
-        prev.map((c) =>
-          c.id === cardId
-            ? { ...c, result: { ...c.result, generating: false, generateError: message } }
-            : c,
-        ),
-      );
+      settleGenerateError(cardId, err instanceof Error ? err.message : String(err));
     }
   }
 

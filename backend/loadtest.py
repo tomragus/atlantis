@@ -29,11 +29,24 @@ SAMPLE_IMAGES = [
     "05-minion.png", "06-cool-cat.png", "07-spooky.png", "08-mona-lisa.png",
 ]
 
+# How often to re-poll GET /generate/{run_id}/status while queued. Faster
+# than the frontend's own ~3s cadence -- there's no real client here to be
+# gentle with, and a tighter loop gets more position samples per run to
+# verify the countdown against.
+QUEUE_POLL_SECONDS = 1.0
+
 
 class VisitorResult:
     def __init__(self):
         self.latencies: dict[str, list[float]] = {"tag": [], "generate": []}
         self.errors: list[str] = []
+        # How many /generate calls came back `queued` at least once, out of
+        # how many were attempted -- lets main() report what fraction of
+        # this run actually exercised the queue rather than only the fast
+        # path (which needs concurrency > MAX_CONCURRENT_GENERATIONS to
+        # ever happen at all).
+        self.queued = 0
+        self.generate_attempts = 0
 
 
 def run_visitor(
@@ -68,6 +81,7 @@ def run_visitor(
         if skip_generate:
             continue
 
+        result.generate_attempts += 1
         start = time.monotonic()
         try:
             resp = requests.post(
@@ -79,9 +93,48 @@ def run_visitor(
         except requests.RequestException as exc:
             result.errors.append(f"generate transport error: {exc}")
             continue
-        result.latencies["generate"].append(time.monotonic() - start)
         if resp.status_code != 200:
             result.errors.append(f"generate HTTP {resp.status_code}: {resp.text[:200]}")
+            continue
+
+        # A `queued` POST response means apiframe's MAX_CONCURRENT_GENERATIONS
+        # slots were all taken -- poll GET .../status until this run finishes
+        # (or errors), so the latency recorded below reflects total
+        # wait-plus-render time, not just the near-instant initial POST. A
+        # fast-path response (a slot was free) has no "status" key at all --
+        # it's the same finished-song shape /generate has always returned --
+        # so the loop below never runs for that case.
+        body = resp.json()
+        positions: list[int] = []
+        was_queued = False
+        while body.get("status") == "queued":
+            was_queued = True
+            if "position" in body:
+                positions.append(body["position"])
+            time.sleep(QUEUE_POLL_SECONDS)
+            try:
+                resp = requests.get(
+                    f"{base_url}/generate/{run_id}/status",
+                    cookies={"session_id": session_cookie},
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                result.errors.append(f"generate status transport error: {exc}")
+                body = {}
+                break
+            if resp.status_code != 200:
+                result.errors.append(f"generate status HTTP {resp.status_code}: {resp.text[:200]}")
+                body = {}
+                break
+            body = resp.json()
+
+        result.latencies["generate"].append(time.monotonic() - start)
+        result.queued += was_queued
+
+        if len(positions) > 1 and any(b > a for a, b in zip(positions, positions[1:])):
+            result.errors.append(f"queue position increased instead of counting down: {positions}")
+        if body.get("status") == "error":
+            result.errors.append(f"generate error: {body.get('detail')}")
 
 
 def sample_memory_rss(pid: int, samples: list[int], stop: threading.Event) -> None:
@@ -156,10 +209,22 @@ def main() -> None:
     all_generate = [v for r in results for v in r.latencies["generate"]]
     all_errors = [e for r in results for e in r.errors]
     total_requests = len(all_tag) + len(all_generate) + len(all_errors)
+    total_generate_attempts = sum(r.generate_attempts for r in results)
+    total_queued = sum(r.queued for r in results)
+    cap_violations = [e for e in all_errors if "concurrency cap violated" in e]
 
     print(f"\n=== concurrency={args.concurrency} cycles={args.cycles} wall_time={wall_elapsed:.1f}s ===")
     print(f"total requests attempted: {total_requests}, errors: {len(all_errors)} "
           f"({100 * len(all_errors) / max(total_requests, 1):.1f}%)")
+    if not args.skip_generate:
+        print(
+            f"generate calls that hit the queue (not the fast path): {total_queued}/"
+            f"{total_generate_attempts}"
+        )
+        print(
+            "apiframe concurrency cap: "
+            + (f"VIOLATED {len(cap_violations)} time(s) -- see errors below" if cap_violations else "never violated")
+        )
     for label, values in [("tag", all_tag), ("generate", all_generate)]:
         if not values:
             print(f"{label}: no successful requests")

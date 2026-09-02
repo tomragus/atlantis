@@ -117,13 +117,30 @@ export type GeneratedSong = {
   tracks: Track[];
 };
 
+// What GET /generate/{run_id}/status returns while a card is mid-generate --
+// a discriminated union on `status`, so callers narrow with an if/switch
+// before reading the fields specific to that state. `done`'s extra fields
+// mirror POST /generate's own success shape (same backend
+// _generation_response either way), since the poll loop hands its result
+// straight to the same `generated` field the fast path already fills.
+export type GenerateStatusResponse =
+  | { status: "queued"; position: number }
+  | { status: "generating" }
+  | { status: "error"; detail: string }
+  | ({ status: "done" } & GeneratedSong);
+
 // The current run's tagging/generation state, for whichever algorithm the
-// dropdown had selected when "Extract Tags" was clicked.
+// dropdown had selected when "Extract Tags" was clicked. `queuePosition` is
+// set only while POST /generate (or a status poll) most recently reported
+// `queued` -- undefined once the ticket goes active, whether or not
+// `generating` is still true, so the UI can tell "waiting in line" apart
+// from "actively rendering" without a third boolean to keep in sync.
 export type RunResult = {
   status: "loading" | "ready" | "error";
   analysis?: Analysis;
   error?: string;
   generating?: boolean;
+  queuePosition?: number;
   generated?: GeneratedSong;
   generateError?: string;
 };
@@ -220,9 +237,18 @@ export function cardFromAnalysis(analysis: Analysis): Card {
 // `POST /generate`'s whole request now: just the run id to fill in tracks
 // for -- the backend looks the rest (prompt, algorithm, image source) up
 // off its own session record, so there's no FormData/body to build here
-// the way the old tags/tag_scores/tagging/prompt echo needed.
+// the way the old tags/tag_scores/tagging/prompt echo needed. Its response
+// is either today's plain GeneratedSong-shaped success (a queue slot was
+// free immediately) or `{status: "queued", position}` -- see
+// GenerateStatusResponse and generateStatusUrl below for what a queued run
+// then polls.
 export const generateUrl = (runId: string) =>
   `${API_URL}/generate?run_id=${encodeURIComponent(runId)}`;
+
+// Polled every ~3s while a run is queued -- see GenerateStatusResponse for
+// the response shape.
+export const generateStatusUrl = (runId: string) =>
+  `${API_URL}/generate/${encodeURIComponent(runId)}/status`;
 
 // Which of a judge pass's verdicts actually get shown as a dropped tag, and
 // what to say about each -- shared data-shaping for JudgeReviewSection.

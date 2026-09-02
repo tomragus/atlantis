@@ -24,6 +24,7 @@ import hashlib
 import os
 import pickle
 import random
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -225,37 +226,55 @@ _MAX_MUTATE_ATTEMPTS = 10
 _MUTATE_BACKOFF_BASE_SECONDS = 0.02
 _MUTATE_BACKOFF_CAP_SECONDS = 0.5
 
+# Guards local-mode pickled-blob writes against real thread concurrency --
+# FastAPI/uvicorn runs each sync `def` route handler in its own worker
+# thread even in local dev (see main.py's routes), so two requests landing
+# at once could otherwise race a plain read-modify-write. Session records
+# never needed this: main.py's own per-token _lock_for already serializes
+# same-token writes, and different tokens' records live in different files
+# with no shared state to race over. The queue (below) has no such
+# upstream lock -- it's one global blob every visitor's requests write to
+# -- so this single lock is what keeps _mutate_pickled_blob's local branch
+# safe for both use cases rather than asking main.py to invent a
+# queue-specific lock for the same job. GCS mode doesn't need it: its
+# branch is already safe via if_generation_match, the real cross-instance
+# guarantee this is only standing in for locally.
+_local_mutate_lock = threading.Lock()
 
-def mutate_session_records(token: str, mutate) -> list[dict]:
-    """Reads this visitor's current run list, applies `mutate` (a function
-    taking that list and returning the new list to persist), and writes the
-    result back -- the one write path every caller that changes a visitor's
-    session should go through instead of save_session_records directly.
 
-    Locally (SESSION_BUCKET unset) that's a plain read-modify-write: always
-    one process, so nothing else can have changed the file in between. In
-    GCS mode it's optimistic concurrency instead: the blob's generation is
-    read alongside its content, and the write is conditioned on that
-    generation still being current (`if_generation_match`) so a second Cloud
-    Run instance's concurrent write can't silently clobber this one. A
-    conflict re-reads the now-current data and retries `mutate` against it,
-    up to `_MAX_MUTATE_ATTEMPTS` times before giving up -- so `mutate` may
-    run more than once and must be a pure function of the list it's given,
-    with no side effects beyond building the new list (main.py's callers
-    that also need to raise on some condition, e.g. the session cap, do so
-    from inside `mutate` itself so that check is against the freshest data
-    too, not whatever this process last cached).
+def _mutate_pickled_blob(local_path: Path, blob_name: str, mutate):
+    """The generic "read a blob's generation, apply a pure mutator, write
+    back conditioned on that generation, retry with jittered backoff on a
+    losing race" shape -- factored out of what was originally
+    mutate_session_records's own body so the new global queue store
+    (mutate_queue, below) can reuse the exact same cross-instance-safety
+    logic instead of carrying a second copy of it. Every caller's `mutate`
+    must be a pure function of the list it's given, for the same reason
+    mutate_session_records' own docstring has always explained: it may run
+    more than once per call, against whatever the freshest read turned up,
+    if an earlier attempt lost a generation race.
+
+    Local mode (SESSION_BUCKET unset) is a plain read-modify-write under
+    _local_mutate_lock; GCS mode is the optimistic-concurrency loop --
+    `if_generation_match` on the write means a second Cloud Run instance's
+    concurrent write can't silently clobber this one, and a losing
+    PreconditionFailed re-reads and retries `mutate` against the fresher
+    data, up to _MAX_MUTATE_ATTEMPTS times before giving up.
     """
     bucket = _bucket()
     if bucket is None:
-        records = load_session_records(token) or []
-        new_records = mutate(records)
-        save_session_records(token, new_records)
-        return new_records
+        with _local_mutate_lock:
+            if not local_path.is_file():
+                records = []
+            else:
+                records = pickle.loads(local_path.read_bytes())
+            new_records = mutate(records)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(pickle.dumps(new_records))
+            return new_records
 
     from google.api_core.exceptions import PreconditionFailed
 
-    name = _session_blob_name(token)
     for attempt in range(_MAX_MUTATE_ATTEMPTS):
         if attempt > 0:
             # Exponential-ish jitter: spreads out retries so two writers who
@@ -264,7 +283,7 @@ def mutate_session_records(token: str, mutate) -> list[dict]:
             backoff = min(_MUTATE_BACKOFF_CAP_SECONDS, _MUTATE_BACKOFF_BASE_SECONDS * (2 ** attempt))
             time.sleep(random.uniform(0, backoff))
 
-        blob = bucket.get_blob(name)
+        blob = bucket.get_blob(blob_name)
         if blob is None:
             generation, records = 0, []
         else:
@@ -273,15 +292,31 @@ def mutate_session_records(token: str, mutate) -> list[dict]:
         new_records = mutate(records)
         data = pickle.dumps(new_records)
         try:
-            bucket.blob(name).upload_from_string(data, if_generation_match=generation)
+            bucket.blob(blob_name).upload_from_string(data, if_generation_match=generation)
             return new_records
         except PreconditionFailed:
             continue  # someone else wrote first -- re-read and retry against their version
 
     raise SessionWriteConflict(
-        f"Could not save session records after {_MAX_MUTATE_ATTEMPTS} attempts "
-        "-- repeated concurrent writes to the same visitor's session."
+        f"Could not save {blob_name!r} after {_MAX_MUTATE_ATTEMPTS} attempts "
+        "-- repeated concurrent writes to the same blob."
     )
+
+
+def mutate_session_records(token: str, mutate) -> list[dict]:
+    """Reads this visitor's current run list, applies `mutate` (a function
+    taking that list and returning the new list to persist), and writes the
+    result back -- the one write path every caller that changes a visitor's
+    session should go through instead of save_session_records directly.
+
+    Thin wrapper around _mutate_pickled_blob -- see that function for the
+    actual local-vs-GCS mechanics, and its docstring for why `mutate` must
+    be pure (main.py's callers that also need to raise on some condition,
+    e.g. the session cap, do so from inside `mutate` itself so that check
+    is against the freshest data too, not whatever this process last
+    cached).
+    """
+    return _mutate_pickled_blob(_session_path(token), _session_blob_name(token), mutate)
 
 
 def delete_session_records(token: str) -> None:
@@ -398,3 +433,191 @@ def release_generation_claim(token: str, run_id: str) -> None:
         bucket.blob(_claim_blob_name(token, run_id)).delete()
     except Exception as exc:
         print(f"could not release generation claim for {run_id!r}: {exc}")
+
+
+# --- Global generation queue ---------------------------------------------
+#
+# apiframe's account only supports a handful of concurrent Suno jobs at
+# once (main.py's MAX_CONCURRENT_GENERATIONS), and that cap is account-wide,
+# not per-instance -- so gating it needs one global ticket list every
+# visitor's /generate request shares, unlike everything else in this module
+# (which is scoped per visitor token). Unlike claim_generation, there's no
+# local-dev-only shortcut here: even a single local process can have more
+# than a handful of requests concurrently mid-/generate (uvicorn runs each
+# sync route handler in its own thread), so the same storage-backed ticket
+# list is used in both modes -- see _mutate_pickled_blob above for the
+# local-file-vs-GCS split every function below goes through.
+#
+# One dict per ticket: run_id, token (who it belongs to, for bookkeeping --
+# nothing here reads it back), joined_at (when it was first enqueued,
+# what waiting position is ranked by), last_seen (heartbeat, refreshed by
+# every status poll -- what the waiting-staleness sweep checks), status
+# ("waiting" or "active"), claimed_at (when it was promoted to active --
+# what the active-staleness sweep checks, None while still waiting).
+
+_QUEUE_BLOB_NAME = "queue/state"
+_QUEUE_LOCAL_PATH = HISTORY_DIR / "_queue.pkl"
+
+
+def _load_queue() -> list[dict]:
+    """The current ticket list, read-only. Never use this as the basis for
+    a write -- that's what mutate_queue's own fresh read-under-retry is
+    for; a write built off this instead could clobber a concurrent change."""
+    bucket = _bucket()
+    if bucket is None:
+        if not _QUEUE_LOCAL_PATH.is_file():
+            return []
+        return pickle.loads(_QUEUE_LOCAL_PATH.read_bytes())
+    blob = bucket.blob(_QUEUE_BLOB_NAME)
+    if not blob.exists():
+        return []
+    return pickle.loads(blob.download_as_bytes())
+
+
+def _sweep_and_promote(
+    tickets: list[dict],
+    now: datetime,
+    waiting_stale_after: timedelta,
+    active_stale_after: timedelta,
+    max_concurrent: int,
+) -> list[dict]:
+    """Pure: drops tickets stale by either rule, then promotes
+    oldest-waiting tickets to active while there's room under
+    max_concurrent. Split out from mutate_queue below so its enqueue path
+    and its touch-only path both run the exact same sweep-then-promote
+    rule instead of two near-copies of it.
+
+    A waiting ticket goes stale if it hasn't been polled (last_seen
+    refreshed) within waiting_stale_after -- the tab-closed/network-dropped
+    case. An active ticket goes stale if it's been claimed_at longer than
+    active_stale_after without finishing -- the crash-recovery case, the
+    same reasoning as main.py's GENERATION_CLAIM_STALE_AFTER for
+    claim_generation: a real generation should never legitimately run
+    longer than that, so anything still active past it was left behind by
+    an instance that got recycled mid-request rather than one still
+    genuinely working.
+    """
+    survivors = [
+        ticket
+        for ticket in tickets
+        if (
+            now - ticket["last_seen"] <= waiting_stale_after
+            if ticket["status"] == "waiting"
+            else now - ticket["claimed_at"] <= active_stale_after
+        )
+    ]
+
+    active_count = sum(1 for ticket in survivors if ticket["status"] == "active")
+    room = max(0, max_concurrent - active_count)
+    waiting = sorted(
+        (ticket for ticket in survivors if ticket["status"] == "waiting"),
+        key=lambda ticket: ticket["joined_at"],
+    )
+    promoted_ids = {ticket["run_id"] for ticket in waiting[:room]}
+
+    return [
+        {**ticket, "status": "active", "claimed_at": now}
+        if ticket["run_id"] in promoted_ids
+        else ticket
+        for ticket in survivors
+    ]
+
+
+def mutate_queue(
+    run_id: str,
+    token: str,
+    waiting_stale_after: timedelta,
+    active_stale_after: timedelta,
+    max_concurrent: int,
+) -> list[dict]:
+    """The one entry point for advancing the global generation queue --
+    main.py calls this both to enqueue a brand-new run_id (POST /generate)
+    and to refresh an existing ticket's heartbeat while checking on it
+    (GET /generate/{run_id}/status). Both cases share one code path
+    because "touch this ticket, creating it if it isn't there yet" is the
+    same operation either way, and both need the same sweep-then-promote
+    pass to run immediately afterward, atomically, so nobody can observe a
+    state where a slot freed by the sweep hasn't yet been offered to the
+    oldest waiter.
+
+    Enqueueing is idempotent: a retry or double-click for a run_id that
+    already has a ticket just refreshes its last_seen rather than creating
+    a second one. Callers must not call this for a run_id whose generation
+    has already finished (main.py checks the session record's
+    tracks/generate_error fields before ever reaching here) -- a finished
+    run's ticket is deliberately removed by release_queue_ticket, and this
+    function has no way to distinguish "never enqueued" from "already
+    finished and released," so calling it after release would silently
+    re-enqueue a done run as a fresh waiting ticket.
+
+    Goes through _mutate_pickled_blob, so this is atomic the same way
+    mutate_session_records is: two callers racing each other never both
+    see room for the same slot, because the second one's write is
+    conditioned on the generation the first one's write just advanced
+    past.
+    """
+
+    def _mutate(tickets: list[dict]) -> list[dict]:
+        now = datetime.now(timezone.utc)
+        found = False
+        touched = []
+        for ticket in tickets:
+            if ticket["run_id"] == run_id:
+                found = True
+                ticket = {**ticket, "last_seen": now}
+            touched.append(ticket)
+        if not found:
+            touched.append(
+                {
+                    "run_id": run_id,
+                    "token": token,
+                    "joined_at": now,
+                    "last_seen": now,
+                    "status": "waiting",
+                    "claimed_at": None,
+                }
+            )
+        return _sweep_and_promote(touched, now, waiting_stale_after, active_stale_after, max_concurrent)
+
+    return _mutate_pickled_blob(_QUEUE_LOCAL_PATH, _QUEUE_BLOB_NAME, _mutate)
+
+
+def release_queue_ticket(run_id: str) -> None:
+    """Removes run_id's ticket, freeing its slot -- called once
+    _run_generation stops actually running (success or failure) so the
+    slot doesn't sit reserved until some future poll's staleness sweep
+    notices it. Doesn't itself promote the next-in-line: the next
+    mutate_queue call (that visitor's own next poll, or any other
+    request's queue touch) does its own sweep-and-promote pass and picks
+    up the now-free slot then -- consistent with every queue-wait and
+    apiframe-submission step in this feature only ever running inside a
+    foreground request, never a background task with nothing driving it.
+    """
+
+    def _mutate(tickets: list[dict]) -> list[dict]:
+        return [ticket for ticket in tickets if ticket["run_id"] != run_id]
+
+    _mutate_pickled_blob(_QUEUE_LOCAL_PATH, _QUEUE_BLOB_NAME, _mutate)
+
+
+def ticket_position(tickets: list[dict], run_id: str) -> int | None:
+    """Where run_id ranks among the currently-waiting tickets in this list
+    (0 = next up), or None if it isn't currently waiting -- already
+    active, or has no ticket at all. Takes a ticket list rather than
+    reading storage itself so a caller that just got a fresh list back
+    from mutate_queue can rank against that exact state instead of paying
+    for (and risking a race against) a second read."""
+    waiting = sorted(
+        (ticket for ticket in tickets if ticket["status"] == "waiting"),
+        key=lambda ticket: ticket["joined_at"],
+    )
+    for index, ticket in enumerate(waiting):
+        if ticket["run_id"] == run_id:
+            return index
+    return None
+
+
+def queue_position(run_id: str) -> int | None:
+    """Convenience wrapper around ticket_position for a caller that
+    doesn't already have a fresh ticket list in hand."""
+    return ticket_position(_load_queue(), run_id)
