@@ -39,6 +39,7 @@ backend/thumbnail_cache/
 /PLAN-phase4-optimization.md
 /PLAN-generation-queue.md
 /PLAN-generate-bounded-wait.md
+/PLAN-phase5-domain-and-cloud-armor.md
 
 # Throwaway local sandbox, not part of the app
 /musicgen-experiment/

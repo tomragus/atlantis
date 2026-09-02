@@ -772,7 +772,10 @@ export const AboutSection = memo(function AboutSection({
       </p>
 
       <div className="about-attribution">
-        <span>&copy; {new Date().getFullYear()} Tom Ragus</span>
+        <div className="about-attribution-text">
+          <span>Expect best performance on Google Chrome.</span>
+          <span>&copy; {new Date().getFullYear()} Tom Ragus</span>
+        </div>
         <a
           href="https://buymeacoffee.com/tomragus"
           target="_blank"

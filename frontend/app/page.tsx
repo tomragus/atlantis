@@ -377,16 +377,6 @@ export default function Home() {
         pollGenerateStatus(cardId);
         return;
       }
-      if (data.status === "generating") {
-        // A slot was free immediately, but the backend only waits up to
-        // ~15s per request for Suno before responding (see
-        // PLAN-generate-bounded-wait.md) -- the render is still going, so
-        // fall back to the same status polling the queued path already
-        // uses. The "Composing..." state (generating && no queuePosition)
-        // already covers this; nothing else needs to change here.
-        pollGenerateStatus(cardId);
-        return;
-      }
       // The fast path: a queue slot was free immediately and the render
       // finished inside the bounded wait, so `data` is the plain generated
       // song, not a queue-shaped response.

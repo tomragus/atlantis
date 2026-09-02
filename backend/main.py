@@ -82,23 +82,6 @@ APIFRAME_BASE_URL = "https://api.apiframe.ai/v2"
 POLL_EVERY_SECONDS = 5
 GIVE_UP_AFTER_SECONDS = 300
 
-# How long a single foreground request may spend actively checking on a
-# Suno job before giving up and reporting "still generating" back to the
-# frontend instead -- bounds every request that might touch apiframe so no
-# HTTP request through the load balancer is ever held open for a whole
-# render. Comfortably under Cloudflare's ~100s default origin timeout and
-# whatever threshold was actually tripping Safari's NSURLErrorNetworkConnection
-# Lost through the new GCP load balancer (see PLAN-generate-bounded-wait.md);
-# a later poll (GET .../status, ~3s cadence) picks up from generate_job_id
-# instead of this request waiting any longer.
-STATUS_CHECK_SECONDS = 15
-
-# Per-call network timeout used only by the bounded status check above --
-# short enough that a single hung apiframe call can't by itself blow past
-# STATUS_CHECK_SECONDS. apiframe_call's own default (30s) stays what
-# submission and every other one-shot call use.
-STATUS_CHECK_HTTP_TIMEOUT = 10
-
 # apiframe's account only supports this many concurrent Suno jobs -- a 6th
 # submission errors outright. This is account-wide, not per-instance, so it
 # has to be enforced by the global queue in storage.py (mutate_queue et al.)
@@ -166,15 +149,11 @@ _session_locks: dict[str, threading.Lock] = {}
 # far more briefly than any _session_locks[token] itself.
 _session_locks_meta_lock = threading.Lock()
 
-# run_ids with a currently-held generation claim, so a retry or double-click
-# racing an in-flight Suno submission or finalize doesn't pay for a second
-# one (see _submit_if_needed/_advance_generation) -- NOT "this run_id is
-# somewhere between submit and done" the way it used to mean when one claim
-# was held for an entire render; a run can now sit with a job submitted and
-# rendering, nothing in this set, for most of its generation. Deliberately
-# not a field on the session record itself: that dict is
-# what storage.save_session_records pickles, and a mid-flight-only flag has
-# no business being persisted (or briefly leaking into a save some other
+# run_ids currently generating a song in this process, so a retry or
+# double-click racing an in-flight generation doesn't pay for a second one.
+# Deliberately not a field on the session record itself: that dict is what
+# storage.save_session_records pickles, and a mid-flight-only flag has no
+# business being persisted (or briefly leaking into a save some other
 # request triggers while /generate is still running).
 #
 # Process-local, same limitation as _sessions/_lock_for above -- safe today
@@ -229,17 +208,6 @@ def _generation_in_progress(token: str, run_id: str) -> bool:
     unlike _claim_generation. Call while holding `_lock_for(token)`, same as
     _claim_generation, for local-mode consistency with generate()'s own set
     check.
-
-    NOTE: since _submit_if_needed/_advance_generation split one long-held
-    claim into two short ones (see PLAN-generate-bounded-wait.md), this no
-    longer covers a run's entire time in flight -- a run with a submitted,
-    still-rendering Suno job (generate_job_id set, no tracks/generate_error
-    yet) holds no claim at all for most of its render, so this returns
-    False for it then. delete_run's guard against deleting a truly in-flight
-    run is narrower than it used to be as a result; widening it (e.g.
-    treating "generate_job_id set and unresolved" as in-progress too)
-    wasn't part of this change's scope, and is flagged as a finding rather
-    than fixed here.
     """
     if storage.gcs_configured():
         return storage.generation_claimed(token, run_id, GENERATION_CLAIM_STALE_AFTER)
@@ -399,7 +367,7 @@ def read_image(image: UploadFile) -> bytes:
     return image.file.read()
 
 
-def apiframe_call(method: str, path: str, timeout: int = 30, **kwargs) -> dict:
+def apiframe_call(method: str, path: str, **kwargs) -> dict:
     api_key = os.environ.get("APIFRAME_API_KEY")
     if not api_key:
         raise HTTPException(
@@ -410,7 +378,7 @@ def apiframe_call(method: str, path: str, timeout: int = 30, **kwargs) -> dict:
         method,
         f"{APIFRAME_BASE_URL}{path}",
         headers={"X-API-Key": api_key},
-        timeout=timeout,
+        timeout=30,
         **kwargs,
     )
     if not response.ok:
@@ -420,17 +388,31 @@ def apiframe_call(method: str, path: str, timeout: int = 30, **kwargs) -> dict:
     return response.json()
 
 
-def submit_song(prompt: str) -> str:
-    """Submits the prompt to Suno and returns the job id right away, without
-    waiting for it to render.
+def wait_for_job(job_id: str, what: str) -> dict:
+    """Polls one apiframe job until it finishes. Blocks for a minute or more.
 
-    Deliberately split from checking on that job (_check_job_status below):
-    submission and waiting now happen under separate, short-lived claims --
-    possibly in separate HTTP requests, since the job id has to survive past
-    the request that submitted it (see generate_job_id on the session
-    record, and PLAN-generate-bounded-wait.md for why).
+    apiframe returns a job id immediately rather than the finished thing, so every
+    generation ends in a loop like this one, songs and images alike.
     """
-    return apiframe_call(
+    deadline = time.monotonic() + GIVE_UP_AFTER_SECONDS
+    status = "QUEUED"
+    while time.monotonic() < deadline:
+        time.sleep(POLL_EVERY_SECONDS)
+        job = apiframe_call("GET", f"/jobs/{job_id}")
+        status = job["status"]
+        if status == "COMPLETED":
+            return job
+        if status == "FAILED":
+            raise HTTPException(502, job.get("error") or f"Could not generate the {what}.")
+
+    raise HTTPException(
+        504, f"The {what} was still '{status}' after {GIVE_UP_AFTER_SECONDS} seconds."
+    )
+
+
+def request_song(prompt: str) -> dict:
+    """Submits the prompt to Suno and waits for the job to finish rendering."""
+    job_id = apiframe_call(
         "POST",
         "/music/generate",
         json={
@@ -444,33 +426,7 @@ def submit_song(prompt: str) -> str:
             },
         },
     )["jobId"]
-
-
-def _check_job_status(job_id: str, what: str) -> dict | None:
-    """Checks one apiframe job for up to STATUS_CHECK_SECONDS, sleeping
-    POLL_EVERY_SECONDS between checks -- replaces the old wait_for_job's
-    multi-minute blocking loop with one bounded enough that a single HTTP
-    request can never be held open for a whole render.
-
-    Returns the finished job dict once it reaches COMPLETED, raises
-    HTTPException on FAILED (same contract wait_for_job used to have), or
-    returns None if it's still pending when the bound elapses -- the caller
-    reports {"status": "generating"} and a later poll (GET .../status)
-    checks again from generate_job_id instead of this request waiting any
-    longer. Read-only and side-effect-free, so callers don't need a claim
-    just to call this.
-    """
-    deadline = time.monotonic() + STATUS_CHECK_SECONDS
-    while True:
-        job = apiframe_call("GET", f"/jobs/{job_id}", timeout=STATUS_CHECK_HTTP_TIMEOUT)
-        status = job["status"]
-        if status == "COMPLETED":
-            return job
-        if status == "FAILED":
-            raise HTTPException(502, job.get("error") or f"Could not generate the {what}.")
-        if time.monotonic() + POLL_EVERY_SECONDS >= deadline:
-            return None
-        time.sleep(POLL_EVERY_SECONDS)
+    return wait_for_job(job_id, "song")
 
 
 def safe_for_filename(text: str) -> str:
@@ -977,14 +933,6 @@ def tag(
         "tagging": tagging,
         "prompt": prompt,
         "tracks": None,
-        # Set once submission actually happens (see _submit_if_needed) so a
-        # later poll -- possibly a different request, possibly a different
-        # Cloud Run instance -- can check on an in-flight Suno job instead of
-        # resubmitting it. Initialized eagerly (unlike generate_error, which
-        # is only ever added lazily on first failure) so callers can always
-        # read it without a fallback default; existing records saved before
-        # this field existed are still handled defensively via .get() below.
-        "generate_job_id": None,
     }
     # Re-checked here, inside the lock and against mutate_session_records'
     # own fresh read, rather than trusting the early check above or this
@@ -1029,151 +977,47 @@ def _generation_response(run_id: str, record: dict, job_id: str | None, tracks: 
     }
 
 
-def _fail_generation(token: str, run_id: str, detail: str) -> None:
-    """Persists a transient generate_error on the session record (via
-    mutate_session_records) and releases this run's queue ticket -- shared
-    by both places _advance_generation can fail (the bounded status check
-    coming back FAILED, or save_audio itself raising once a job's
-    COMPLETED). Also clears generate_job_id: without that, a later retry
-    would find this dead job's id still on the record and check on it again
-    forever instead of ever submitting a fresh one.
+def _run_generation(token: str, run_id: str, record: dict) -> dict:
+    """Does the actual Suno submission, audio download, and record update
+    for a run whose generation claim the caller already holds (via a
+    caller-side `_claim_generation(token, run_id)` that returned True) --
+    the one piece of work both /generate's own fast path (a queue slot was
+    free immediately) and GET .../status (a waiting ticket just got
+    promoted) need to run identically. This function doesn't attempt the
+    claim itself -- each call site's own claim-then-call-this shape differs
+    slightly (see both below), so the claim attempt stays there, same as it
+    always has.
 
-    Doesn't touch a generation claim itself -- whether one's actually held
-    at the point of failure differs between the two call sites (the status
-    check runs claim-free; save_audio runs under the finalize claim), so
-    each caller releases its own, if any, right after calling this.
+    Always releases both the generation claim and this run's queue ticket
+    before returning or raising, so a slot this run held is never left
+    reserved once it stops actually running. On failure, first persists a
+    transient `generate_error` on the session record (via
+    mutate_session_records) -- the caller that hit the exception still sees
+    it raised, same as /generate always has, but this is what lets a
+    *different*, later poll for the same run_id (one that didn't win the
+    claim and so never called this function at all) learn the run failed
+    instead of polling a ticket that's simply vanished.
     """
-    def _record_error(current: list[dict]) -> list[dict]:
-        return [
-            {**r, "generate_error": detail, "generate_job_id": None} if r["id"] == run_id else r
-            for r in current
-        ]
-
-    with _lock_for(token):
-        _update_local_cache(token, storage.mutate_session_records(token, _record_error))
-    storage.release_queue_ticket(run_id)
-
-
-def _submit_if_needed(token: str, run_id: str, record: dict) -> str | None:
-    """Ensures exactly one Suno submission exists for this run, then returns
-    its job id -- or None if this call couldn't get the submission claim
-    (someone else is already submitting) or the run vanished from under it.
-
-    Claims only for the duration of the submission itself (see
-    _claim_generation/_release_generation_claim), never the render that
-    follows -- the render is checked separately, without holding anything,
-    by _check_job_status. A caller that gets None back should treat that
-    exactly like "still generating": no error, nothing to check yet.
-    """
-    if record.get("generate_job_id"):
-        return record["generate_job_id"]
-
-    with _lock_for(token):
-        if not _claim_generation(token, run_id):
-            return None
-
-    # Under the claim now, so no other request can be submitting this run_id
-    # concurrently -- but the claim doesn't itself prove `record` (read by
-    # the caller before any of this ran) is still current. Re-read fresh in
-    # both modes, not just GCS: a previous claim holder can submit and
-    # release entirely in the gap between two of *this* call's own lock
-    # acquisitions (the lock is only held for each short check-then-set, not
-    # continuously across the whole claim), so a losing-then-winning
-    # claimant's original `record` snapshot can predate that write even in
-    # local dev, where storage.load_session_records still reads the on-disk
-    # pickle straight through rather than trusting this process's cached
-    # dict. Also catches a run deleted before this claim was ever attempted.
-    fresh = storage.load_session_records(token) or []
-    fresh_record = find_session(fresh, run_id)
-    if fresh_record is None:
-        with _lock_for(token):
-            _release_generation_claim(token, run_id)
-        storage.release_queue_ticket(run_id)
-        raise HTTPException(404, f"No run with id {run_id!r}. It was deleted just now.")
-
-    job_id = fresh_record.get("generate_job_id")
-    if not job_id:
-        # The one Suno-billing network call in this whole function --
-        # everything else here is metadata bookkeeping, safe to repeat.
-        # Must stay outside the mutate() below: mutate_session_records may
-        # retry its mutator against a fresher read under GCS contention, and
-        # a retried Suno submission would mean a second, unwanted job.
-        job_id = submit_song(fresh_record["prompt"])
-
-        def _persist_job_id(current: list[dict]) -> list[dict]:
-            # `or job_id` rather than an unconditional overwrite: defensive
-            # against a job id somehow already having landed here between
-            # our fresh read above and this write, so this write can never
-            # clobber it with our own (redundant, but harmless) submission.
-            return [
-                {**r, "generate_job_id": r.get("generate_job_id") or job_id} if r["id"] == run_id else r
-                for r in current
-            ]
-
-        with _lock_for(token):
-            _update_local_cache(token, storage.mutate_session_records(token, _persist_job_id))
-
-    with _lock_for(token):
-        _release_generation_claim(token, run_id)
-
-    return job_id
-
-
-def _advance_generation(token: str, run_id: str, record: dict) -> dict:
-    """Moves one run's generation forward by at most STATUS_CHECK_SECONDS of
-    actual waiting, then returns -- replaces the old _run_generation, which
-    held one HTTP request open for the entire multi-minute render. Safe to
-    call repeatedly, from different requests and even different instances,
-    for as long as a run's queue ticket stays active:
-
-    - No generate_job_id yet: try to claim submission (_submit_if_needed).
-      Losing that race isn't an error -- it just means someone else is
-      already submitting, so this call reports the same "still generating"
-      a not-yet-done job would.
-    - A job id (just-submitted, or already on the record from an earlier
-      call): one bounded, claim-free status check. Still pending ->
-      "generating", with the queue ticket and everything else left
-      untouched, since the run legitimately isn't done. COMPLETED -> claim
-      just this finalize step, download+save the audio, persist tracks,
-      release the claim and the queue ticket, return the finished result.
-      FAILED -> persist the error and release the queue ticket (via
-      _fail_generation), then raise, same as the old failure path.
-    """
-    job_id = _submit_if_needed(token, run_id, record)
-    if job_id is None:
-        return {"status": "generating"}
-
     image_source = record["image_source"]
     original_filename = (
         image_source["filename"] if image_source["kind"] == "upload" else image_source["name"]
     )
 
     try:
-        job = _check_job_status(job_id, "song")
+        job = request_song(record["prompt"])
+        tracks = save_audio(token, run_id, original_filename, job, record["algorithm"])
     except Exception as exc:
         # HTTPException carries a real user-facing message in .detail; any
         # other exception's str() is the best we have.
         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        _fail_generation(token, run_id, detail)
-        raise
 
-    if job is None:
-        return {"status": "generating"}
+        def _record_error(current: list[dict]) -> list[dict]:
+            return [{**r, "generate_error": detail} if r["id"] == run_id else r for r in current]
 
-    with _lock_for(token):
-        if not _claim_generation(token, run_id):
-            # Someone else is already finalizing this same COMPLETED job --
-            # nothing to do here but report the same "still generating" any
-            # other not-yet-done poll would.
-            return {"status": "generating"}
-
-    try:
-        tracks = save_audio(token, run_id, original_filename, job, record["algorithm"])
-    except Exception as exc:
-        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        _fail_generation(token, run_id, detail)
         with _lock_for(token):
+            _update_local_cache(token, storage.mutate_session_records(token, _record_error))
             _release_generation_claim(token, run_id)
+        storage.release_queue_ticket(run_id)
         raise
 
     # By id, through mutate_session_records, same reasoning as delete_run:
@@ -1181,23 +1025,19 @@ def _advance_generation(token: str, run_id: str, record: dict) -> dict:
     # the field is set against mutate_session_records' own fresh read
     # rather than the in-memory `record` this function was handed -- those
     # other fields (prompt/algorithm/image_source) don't change mid-
-    # generate, only `tracks` does. Also clears generate_error and
-    # generate_job_id: belt-and-suspenders alongside /generate's own
-    # clear-on-retry above, so a successful run never leaves a previous
-    # attempt's failure message or dead job id sitting in the record.
+    # generate, only `tracks` does. Also clears generate_error: belt-and-
+    # suspenders alongside /generate's own clear-on-retry above, so a
+    # successful run never leaves a previous attempt's failure message
+    # sitting in the persisted record.
     def _fill_tracks(current: list[dict]) -> list[dict]:
-        return [
-            {**r, "tracks": tracks, "generate_error": None, "generate_job_id": None}
-            if r["id"] == run_id else r
-            for r in current
-        ]
+        return [{**r, "tracks": tracks, "generate_error": None} if r["id"] == run_id else r for r in current]
 
     with _lock_for(token):
         _update_local_cache(token, storage.mutate_session_records(token, _fill_tracks))
         _release_generation_claim(token, run_id)
     storage.release_queue_ticket(run_id)
 
-    return _generation_response(run_id, record, job_id, tracks)
+    return _generation_response(run_id, record, job["id"], tracks)
 
 
 @app.post("/generate")
@@ -1206,14 +1046,6 @@ def generate(request: Request, run_id: str):
     MAX_CONCURRENT_GENERATIONS slots are all taken, joins the global queue
     and hands back `{"status": "queued", "position": N}` instead of
     touching apiframe at all. The frontend polls GET .../status from there.
-
-    Even when a slot is free immediately, this no longer necessarily
-    finishes the render before responding: it advances the run by at most
-    STATUS_CHECK_SECONDS (see _advance_generation) and can come back
-    `{"status": "generating"}` too, in which case the frontend falls back to
-    the same GET .../status polling the queued path always used. This is
-    what keeps a single request from ever being held open for a whole
-    multi-minute render (see PLAN-generate-bounded-wait.md).
 
     Deliberately does no tagging of its own -- the image, tags, and judge
     verdicts were already settled in `/tag` and are looked up here off the
@@ -1232,9 +1064,8 @@ def generate(request: Request, run_id: str):
     # `tracks` already set means this run was already rendered: hand that
     # back rather than ever touching the queue for a run that's done. Same
     # guard /generate has always had against a retry/double-click after
-    # completion; see _advance_generation/_submit_if_needed for the
-    # still-in-flight case, which now reports {"status": "generating"}
-    # rather than a 409.
+    # completion; see _run_generation's own claim-loss 409 below for the
+    # in-flight case.
     if record["tracks"]:
         return _generation_response(run_id, record, None, record["tracks"])
 
@@ -1265,25 +1096,39 @@ def generate(request: Request, run_id: str):
     if ticket is None or ticket["status"] == "waiting":
         return {"status": "queued", "position": storage.ticket_position(tickets, run_id) or 0}
 
-    # A slot was free immediately -- proceed through the same bounded-wait
-    # path GET .../status uses once a ticket's promoted (_advance_generation
-    # claims only its own short submission/finalize windows, rather than
-    # this route holding one claim for the whole render the way it used to).
-    # A concurrent double-click/retry that loses the submission race no
-    # longer 409s here -- it comes back {"status": "generating"} same as any
-    # other not-yet-done case, and the run vanishing out from under a claim
-    # (GCS mode) is still a 404, just raised from inside _advance_generation
-    # now instead of this route.
-    return _advance_generation(token, run_id, record)
+    # A slot was free immediately -- proceed exactly as /generate always
+    # has, so this stays the fast path with identical behavior/latency
+    # whenever the queue is empty (the common case).
+    with _lock_for(token):
+        if not _claim_generation(token, run_id):
+            # Someone else (a retry, a double-click) already claimed this
+            # run_id's generation -- same 409 /generate has always returned
+            # for that case.
+            raise HTTPException(409, "This run is already generating a song.")
+        # The claim above only proves no OTHER instance is currently
+        # generating this run -- it doesn't prove the run still exists. A
+        # concurrent delete_run on another instance could have removed it
+        # between this process's `find_session` above and now (that route's
+        # own _generation_in_progress check closes the reverse ordering,
+        # but not this one). GCS-mode only: local dev's single shared lock
+        # already makes this interleaving impossible, so the extra read
+        # would be pure overhead there.
+        if storage.gcs_configured():
+            fresh = storage.load_session_records(token) or []
+            if find_session(fresh, run_id) is None:
+                _release_generation_claim(token, run_id)
+                storage.release_queue_ticket(run_id)
+                raise HTTPException(404, f"No run with id {run_id!r}. It was deleted just now.")
+
+    return _run_generation(token, run_id, record)
 
 
 @app.get("/generate/{run_id}/status")
 def generate_status(request: Request, run_id: str):
     """Polled by the frontend (every ~3s) while a /generate call came back
-    `queued` or `generating` -- reports live queue position, and once the
-    ticket's active, advances the run by one more bounded status check each
-    poll (_advance_generation), until it eventually reports "done" or
-    "error".
+    `queued` -- reports live queue position, and eventually either runs the
+    generation itself (if this particular poll is the one that discovers
+    the ticket got promoted and wins the claim) or reports its result.
 
     All queue-wait and apiframe-submission work happens inside this
     foreground request (or inside the original POST's fast path above) and
@@ -1297,7 +1142,7 @@ def generate_status(request: Request, run_id: str):
         raise HTTPException(404, f"No run with id {run_id!r}. It may have been deleted, or the backend restarted since it was tagged.")
 
     # Checked before ever touching the queue: a finished (or failed) run's
-    # ticket was already removed by _advance_generation's own release, and
+    # ticket was already removed by _run_generation's own release, and
     # mutate_queue below would otherwise treat "no ticket found" as "not
     # enqueued yet" and silently resurrect a done run as a fresh waiting
     # ticket.
@@ -1318,16 +1163,18 @@ def generate_status(request: Request, run_id: str):
     if ticket is None or ticket["status"] == "waiting":
         return {"status": "queued", "position": storage.ticket_position(tickets, run_id) or 0}
 
-    # Newly (or already) active -- advance it by at most one bounded status
-    # check (_advance_generation claims its own short submission/finalize
-    # windows internally; a concurrent poll for the same run_id that loses
-    # one of those races just gets "generating" back, same as this one
-    # would). Only wrap the result in "done" when it actually is one --
-    # "generating" already carries its own status.
-    result = _advance_generation(token, run_id, record)
-    if result.get("status") == "generating":
-        return result
-    return {"status": "done", **result}
+    # Newly (or already) active -- attempt the claim ourselves. Winning it
+    # means this exact poll is the one that gets to actually run the
+    # generation; losing it just means a concurrent poll for the same
+    # run_id (another tab, or the frontend's own overlapping timers) got
+    # there first, so there's nothing for this request to do but report
+    # that it's under way.
+    with _lock_for(token):
+        won = _claim_generation(token, run_id)
+    if not won:
+        return {"status": "generating"}
+
+    return {"status": "done", **_run_generation(token, run_id, record)}
 
 
 # Serves the saved images and MP3s, so the frontend can play a song from local
