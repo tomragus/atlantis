@@ -1069,10 +1069,8 @@ h3.about-heading {
   color: var(--ink-on-dark);
 }
 
-.about-attribution-text {
-  display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
+.about-chrome-note {
+  margin-left: auto;
 }
 
 .about-linkedin {

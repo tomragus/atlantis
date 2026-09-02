@@ -377,9 +377,18 @@ export default function Home() {
         pollGenerateStatus(cardId);
         return;
       }
-      // The fast path: a queue slot was free immediately and the render
-      // finished inside the bounded wait, so `data` is the plain generated
-      // song, not a queue-shaped response.
+      if (data.status === "error") {
+        // The fast path streams while it waits on Suno (see
+        // backend/main.py's _run_generation_streamed) -- once that response
+        // starts, its 200 status is already committed, so a failure comes
+        // back this way instead of as an HTTP error status, same shape
+        // pollGenerateStatus already handles below.
+        settleGenerateError(cardId, data.detail);
+        return;
+      }
+      // The fast path: a queue slot was free immediately, so `data` is the
+      // plain generated song once the stream finishes, not a queue-shaped
+      // response.
       settleGenerated(cardId, data);
     } catch (err) {
       settleGenerateError(cardId, err instanceof Error ? err.message : String(err));

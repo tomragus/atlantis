@@ -1,3 +1,4 @@
+import json
 import os
 import secrets
 import threading
@@ -13,7 +14,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # Safe to import at module level: plain strings and a lookup, no heavy dependencies.
@@ -173,6 +174,16 @@ _generating_runs: set[str] = set()
 # queue to carry a second, separately-tuned constant for the same case.
 GENERATION_CLAIM_STALE_AFTER = timedelta(seconds=GIVE_UP_AFTER_SECONDS + 60)
 
+# How often _run_generation_streamed sends a heartbeat byte while a Suno
+# render is still in flight -- comfortably under both Cloudflare's ~125s
+# origin-read timeout (the request would otherwise look idle to it, once
+# the load balancer's Cloudflare proxy is back in front of the app) and the
+# separate 30s-per-write timeout Cloudflare also enforces (irrelevant at
+# this size regardless, but the margin doesn't cost anything). Confirmed
+# live: a real generate call through the proxied domain hit a Cloudflare
+# 524 before this existed.
+GENERATE_HEARTBEAT_SECONDS = 15
+
 
 def _lock_for(token: str) -> threading.Lock:
     with _session_locks_meta_lock:
@@ -324,6 +335,35 @@ async def session_cookie_middleware(request: Request, call_next):
             secure=True,
         )
     return response
+
+
+# The only domains the deployed container should ever be reached as, once
+# step 10's ingress lock restricts Cloud Run to load-balancer traffic only.
+# That lock controls *how* a request reaches the service, not what Host it
+# claims once it's arrived -- anyone who finds the load balancer's own IP
+# can still send it any Host header they like, so this is what actually
+# enforces the expected domain at the application layer, defense in depth
+# on top of (not instead of) the ingress lock itself.
+ALLOWED_HOSTS = {"ideagram.studio", "www.ideagram.studio"}
+
+
+@app.middleware("http")
+async def host_header_guard(request: Request, call_next):
+    """404s any request whose Host header isn't in ALLOWED_HOSTS.
+
+    Only active when FRONTEND_DIST exists -- the same "is this the deployed
+    container" signal used elsewhere in this file -- so local dev's
+    127.0.0.1/localhost requests are never affected. Registered after
+    session_cookie_middleware so it becomes the outermost layer at runtime
+    (see that middleware's own comment on Starlette's stacking order): a
+    request this rejects shouldn't first pay for session-cookie minting or
+    CORS handling it's about to be denied anyway.
+    """
+    if FRONTEND_DIST.is_dir():
+        host = (request.headers.get("host") or "").split(":")[0].lower()
+        if host not in ALLOWED_HOSTS:
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return await call_next(request)
 
 
 @app.exception_handler(storage.SessionWriteConflict)
@@ -1040,6 +1080,58 @@ def _run_generation(token: str, run_id: str, record: dict) -> dict:
     return _generation_response(run_id, record, job["id"], tracks)
 
 
+def _run_generation_streamed(
+    token: str, run_id: str, record: dict, done_shape: dict | None = None
+) -> StreamingResponse:
+    """Runs _run_generation in a background thread while streaming a
+    heartbeat byte on the HTTP response every GENERATE_HEARTBEAT_SECONDS,
+    so this request never sits idle for the minutes a Suno render can take
+    -- the load balancer's Cloudflare proxy in front of this app enforces a
+    ~125s origin timeout that a single ordinary blocking response can
+    exceed. A space is valid, insignificant JSON whitespace before a
+    top-level value (RFC 8259), so the frontend's ordinary
+    `response.json()` parses straight through any heartbeats sent before
+    the real payload, no differently than if none had been sent.
+
+    `done_shape` merges extra fields into a successful result (GET
+    .../status's own `{"status": "done"}`) without touching the error
+    shape, which is always `{"status": "error", "detail": ...}` --
+    matching the shape a *previously* failed run already reports via
+    generate_error, since once this response has started streaming its 200
+    status is already committed and a failure can no longer come back as
+    an HTTP error status the way a direct (non-streamed) call to
+    _run_generation always has.
+    """
+    outcome: dict = {}
+
+    def _work() -> None:
+        try:
+            outcome["result"] = _run_generation(token, run_id, record)
+        except Exception as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_work, daemon=True)
+    thread.start()
+
+    def _body():
+        while thread.is_alive():
+            thread.join(timeout=GENERATE_HEARTBEAT_SECONDS)
+            if thread.is_alive():
+                yield " "
+
+        if "error" in outcome:
+            exc = outcome["error"]
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            yield json.dumps({"status": "error", "detail": detail})
+        else:
+            payload = outcome["result"]
+            if done_shape:
+                payload = {**done_shape, **payload}
+            yield json.dumps(payload)
+
+    return StreamingResponse(_body(), media_type="application/json")
+
+
 @app.post("/generate")
 def generate(request: Request, run_id: str):
     """Renders a song for a run `/tag` already produced -- or, if apiframe's
@@ -1120,7 +1212,7 @@ def generate(request: Request, run_id: str):
                 storage.release_queue_ticket(run_id)
                 raise HTTPException(404, f"No run with id {run_id!r}. It was deleted just now.")
 
-    return _run_generation(token, run_id, record)
+    return _run_generation_streamed(token, run_id, record)
 
 
 @app.get("/generate/{run_id}/status")
@@ -1174,7 +1266,7 @@ def generate_status(request: Request, run_id: str):
     if not won:
         return {"status": "generating"}
 
-    return {"status": "done", **_run_generation(token, run_id, record)}
+    return _run_generation_streamed(token, run_id, record, done_shape={"status": "done"})
 
 
 # Serves the saved images and MP3s, so the frontend can play a song from local

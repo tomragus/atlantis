@@ -1,0 +1,28 @@
+{
+  "displayName": "Ideagram Studio - Cloud Armor rate-limit activity",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "More than 3 requests throttled (429) by Cloud Armor in 5 minutes",
+      "conditionThreshold": {
+        "filter": "resource.type=\"https_lb_rule\" AND resource.labels.backend_target_name=\"ideagram-studio-backend\" AND metric.type=\"loadbalancing.googleapis.com/https/backend_request_count\" AND metric.labels.response_code=\"429\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 3,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "300s",
+            "perSeriesAligner": "ALIGN_COUNT",
+            "crossSeriesReducer": "REDUCE_SUM",
+            "groupByFields": ["resource.label.backend_target_name"]
+          }
+        ],
+        "trigger": { "count": 1 }
+      }
+    }
+  ],
+  "notificationChannels": ["projects/ideagram-studio-507100/notificationChannels/2292650001518004840"],
+  "alertStrategy": {
+    "autoClose": "1800s"
+  }
+}
