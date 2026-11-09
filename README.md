@@ -2,6 +2,8 @@
 
 Ideagram Studio: A better way to compose mood-accurate songs from images using joint embedding spaces
 
+### [Live Site](https://ideagram.studio/)
+
 Upload a picture and (optionally) spin a genre knob; the backend embeds the
 image in SigLIP space, scores it against a fixed adjective vocabulary to pull
 its top 10 tags, composes those tags with the genre into a prompt, and sends
